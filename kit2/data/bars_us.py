@@ -37,7 +37,7 @@ def _typed(bars: pd.DataFrame) -> pd.DataFrame:
 
 
 @lru_cache(maxsize=4)
-def sessions(start: str = "2015-06-01", end: str = "2027-12-31") -> pd.DataFrame:
+def create_cal(start: str = "2015-06-01", end: str = "2026-12-31") -> pd.DataFrame:
     """XNYS schedule (published in advance): session date, open/close as naive UTC, length in minutes."""
     import exchange_calendars as xc
     s = xc.get_calendar("XNYS", start=start, end=end).schedule
@@ -89,7 +89,7 @@ def build_intraday(raw: pd.DataFrame, scale: str, months: Iterable[pd.Period],
     m = minutes_utc(raw)
     if m.empty:
         return _typed(pd.DataFrame(columns=BAR_COLS))
-    cal = sessions()
+    cal = create_cal()
     # session of each minute: the last session whose open <= start (extended minutes belong to that day's date)
     et_day = pd.DatetimeIndex(m["start"]).tz_localize("UTC").tz_convert(ET).tz_localize(None).normalize()
     cal_by_day = cal.set_index("session")
@@ -158,7 +158,7 @@ def build_intraday(raw: pd.DataFrame, scale: str, months: Iterable[pd.Period],
 def build_daily(daily: pd.DataFrame, splits: Optional[pd.DataFrame] = None,
                 divs: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """Raw Alpha Vantage daily rows (date, o/h/l/c/v) -> 1d bars stamped at the session close."""
-    cal = sessions()
+    cal = create_cal()
     daily = daily.assign(date=pd.to_datetime(daily["date"]).astype("datetime64[ns]"))
     d = daily.merge(cal, left_on="date", right_on="session", how="inner").sort_values("session")
     d = d[(d["close_x"] > 0) & (d["open_x"] > 0)].reset_index(drop=True)

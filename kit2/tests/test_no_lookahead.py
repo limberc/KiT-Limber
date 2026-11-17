@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from kit2.data.bars_us import ET, build_daily, build_intraday, sessions
+from kit2.data.bars_us import ET, build_daily, build_intraday, create_cal
 from kit2.data.features import candle_features
 from kit2.data.us_universe import monthly_universe
 
@@ -20,7 +20,7 @@ DIV_DAY = pd.Timestamp("2024-05-29")
 def synth_minutes(seed: int = 0, start="2024-05-13", end="2024-06-21") -> pd.DataFrame:
     """Alpha Vantage-like 1-min rows (ts_start ET, extended hours) with a 10:1 split, missing minutes, a missing day."""
     rng = np.random.default_rng(seed)
-    cal = sessions()
+    cal = create_cal()
     days = cal[(cal["session"] >= start) & (cal["session"] <= end)]
     rows, price = [], 100.0
     for d, o, c in zip(days["session"], days["open"], days["close"]):
@@ -114,7 +114,7 @@ def test_bar_stamped_at_close_uses_only_earlier_minutes(raw):
 
 
 def test_daily_prefix_invariance():
-    cal = sessions()
+    cal = create_cal()
     days = cal[(cal["session"] >= "2023-01-01") & (cal["session"] <= "2024-12-31")]["session"]
     rng = np.random.default_rng(3)
     c = 50 * np.exp(np.cumsum(rng.normal(0, 0.02, len(days))))
@@ -123,7 +123,8 @@ def test_daily_prefix_invariance():
                           "low": np.minimum(o, c) * 0.99, "close": c, "volume": rng.integers(1e5, 1e6, len(days))})
     full = build_daily(daily, SPLITS, DIVS)
     for t in [pd.Timestamp(x) for x in rng.integers(full["ts"].min().value, full["ts"].max().value, 15)]:
-        trunc = build_daily(daily[daily["date"] < t.normalize()], SPLITS, DIVS)
+        avail = daily["date"].map(cal.set_index("session")["close"])     # a daily bar is known at the close
+        trunc = build_daily(daily[(avail <= t).to_numpy()], SPLITS, DIVS)
         pd.testing.assert_frame_equal(_upto(full, t), _upto(trunc, t), check_exact=True)
         f1, f2 = (candle_features(b, 5.0).assign(ts=b["ts"].to_numpy()) for b in (full, trunc))
         pd.testing.assert_frame_equal(_upto(f1, t), _upto(f2, t), check_exact=True)
