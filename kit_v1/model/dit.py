@@ -55,11 +55,9 @@ class KlineDiT(nn.Module):
         self.t_emb = TimestepEmbedding(cfg.t_emb_dim, d)
         self.adaln = SharedAdaLN(d)
         self.rotary = RotaryEmbedding(llama_config(d, cfg.n_heads, cfg.ffn_hidden, cfg.rope_theta))
-        self.blocks = nn.ModuleList([
-            DiTBlock(d, cfg.n_heads, cfg.ffn_hidden, qk_norm=cfg.qk_norm,
-                     backend=cfg.attn_backend)
-            for _ in range(cfg.n_layers)
-        ])
+        self.blocks = nn.ModuleList(
+            [DiTBlock(d, cfg.n_heads, cfg.ffn_hidden, qk_norm=cfg.qk_norm, backend=cfg.attn_backend)
+             for _ in range(cfg.n_layers)])
         # output head
         self.final_norm = RMSNorm(d, eps=1e-6, elementwise_affine=False)
         self.head_bias = nn.Parameter(torch.zeros(2 * d))
@@ -101,8 +99,7 @@ class KlineDiT(nn.Module):
         """t [B] in [0,1] -> [B,d]."""
         return self.t_emb(self.t_proj(t * 1000.0).to(self.t_emb.linear_1.weight.dtype))
 
-    def forward(self,
-                z: torch.Tensor, t: torch.Tensor,
+    def forward(self, z: torch.Tensor, t: torch.Tensor,
                 cond: Dict[str, torch.Tensor], Lh: int,
                 return_aux: bool = False, ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         """z [B,L,F] (clean ctx + noisy tgt); t [B] float in [0,1]; Lh = target length.

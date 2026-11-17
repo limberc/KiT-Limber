@@ -85,8 +85,8 @@ class MultiheadAttention(nn.Module):
         self.qkv = nn.Linear(d, 3 * d, bias=False)
         self.out_proj = nn.Linear(d, d, bias=False)
         # QK-Norm: RMSNorm over head_dim, weights shared across heads
-        self.q_norm: Optional[LlamaRMSNorm] = LlamaRMSNorm(self.head_dim, eps=1e-6) if qk_norm else None
-        self.k_norm: Optional[LlamaRMSNorm] = LlamaRMSNorm(self.head_dim, eps=1e-6) if qk_norm else None
+        self.q_norm: Optional[LlamaRMSNorm] = LlamaRMSNorm(self.head_dim) if qk_norm else None
+        self.k_norm: Optional[LlamaRMSNorm] = LlamaRMSNorm(self.head_dim) if qk_norm else None
         self.backend = resolve_backend(backend)
 
     def forward(self, x: torch.Tensor, pad_mask: Optional[torch.Tensor],

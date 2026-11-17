@@ -16,8 +16,8 @@ from typing import Dict, Union
 import numpy as np
 import pandas as pd
 
+from kit_v1.data import FEATURE_NAMES, compute_features
 from kit_v1.data.calendar import bars_per_day
-from kit_v1.data.features import FEATURE_NAMES, compute_features
 
 DEFAULT_SOFT_CLIP_C: float = 6.0
 _MAD_CONST: float = 1.4826
@@ -47,9 +47,9 @@ def _end_of_day(ts: Union[str, pd.Timestamp]) -> pd.Timestamp:
 
 
 def fit_stats(
-    data_root: Union[str, Path],
-    train_end: Union[str, pd.Timestamp],
-    half_life_days: float = 5.0,
+        data_root: Union[str, Path],
+        train_end: Union[str, pd.Timestamp],
+        half_life_days: float = 5.0,
 ) -> Dict[str, float]:
     """Fit MAD scales per (market, timescale, feature) over a data tree.
 
@@ -115,9 +115,9 @@ def load_stats(path: Union[str, Path]) -> Dict[str, float]:
 
 
 def normalize(
-    x: np.ndarray,
-    scale: float,
-    c: float = DEFAULT_SOFT_CLIP_C,
+        x: np.ndarray,
+        scale: float,
+        c: float = DEFAULT_SOFT_CLIP_C,
 ) -> np.ndarray:
     """y = c * tanh((x / scale) / c), clipped to the open interval (-c, c)."""
     xp = np.asarray(x, dtype=np.float64) / float(scale)
@@ -127,9 +127,9 @@ def normalize(
 
 
 def denormalize(
-    y: np.ndarray,
-    scale: float,
-    c: float = DEFAULT_SOFT_CLIP_C,
+        y: np.ndarray,
+        scale: float,
+        c: float = DEFAULT_SOFT_CLIP_C,
 ) -> np.ndarray:
     """Inverse of normalize; y/c is clamped to +/-(1-1e-6) to keep atanh finite."""
     r = np.asarray(y, dtype=np.float64) / c

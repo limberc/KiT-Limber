@@ -11,7 +11,6 @@ class CondEmbeddings(nn.Module):
 
     Slot 0 is the learnable unknown/null entry (no padding_idx).
     """
-
     def __init__(self, d: int, market_slots: int, sector_slots: int,
                  scale_slots: int, inst_vocab: int, inst_dim: int) -> None:
         super().__init__()

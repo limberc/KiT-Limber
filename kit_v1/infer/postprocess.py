@@ -6,8 +6,8 @@ from typing import Dict, Mapping, Optional, Union
 import numpy as np
 import torch
 
-from kit_v1.data.features import FEATURE_NAMES, invert_features
-from kit_v1.data.normalize import DEFAULT_SOFT_CLIP_C, denormalize, stats_key
+from kit_v1.data import FEATURE_NAMES, invert_features, denormalize
+from kit_v1.data.normalize import DEFAULT_SOFT_CLIP_C, stats_key
 
 # quantile bands
 QUANTILES = (0.05, 0.25, 0.50, 0.75, 0.95)
@@ -23,13 +23,9 @@ def _to_numpy(x: ArrayLike) -> np.ndarray:
     return np.asarray(x, dtype=np.float64)
 
 
-def denormalize_paths(
-    paths: ArrayLike,
-    market: str,
-    timescale: str,
-    stats: Mapping[str, float],
-    c: float = DEFAULT_SOFT_CLIP_C,
-) -> np.ndarray:
+def denormalize_paths(paths: ArrayLike, market: str, timescale: str,
+                      stats: Mapping[str, float],
+                      c: float = DEFAULT_SOFT_CLIP_C) -> np.ndarray:
     """Denormalize per feature using stats. paths: [..., 5] in FEATURE_NAMES order; same shape returned."""
     arr = _to_numpy(paths)
     if arr.shape[-1] != len(FEATURE_NAMES):
@@ -41,12 +37,10 @@ def denormalize_paths(
     return out
 
 
-def paths_to_ohlcv(
-    feats: ArrayLike,
-    prev_close: float,
-    prev_ema: float,
-    half_life_bars: float,
-) -> Dict[str, np.ndarray]:
+def paths_to_ohlcv(feats: ArrayLike,
+                   prev_close: float,
+                   prev_ema: float,
+                   half_life_bars: float) -> Dict[str, np.ndarray]:
     """Convert denormalized feature paths [K,Lh,5] to OHLCV paths.
 
     Each path is rebuilt independently from prev_close / prev_ema, with r_up and r_dn clamped to >= 0.
@@ -61,24 +55,22 @@ def paths_to_ohlcv(
     for k in range(K):
         p = arr[k]
         ohlcv = invert_features(
-            r_gap=p[:, 0],
-            r_body=p[:, 1],
-            r_up=np.maximum(p[:, 2], 0.0),   # keeps H >= max(O,C)
-            r_dn=np.maximum(p[:, 3], 0.0),   # keeps L <= min(O,C)
+            r_gap=p[:, 0], r_body=p[:, 1],
+            r_up=np.maximum(p[:, 2], 0.0),  # keeps H >= max(O,C)
+            r_dn=np.maximum(p[:, 3], 0.0),  # keeps L <= min(O,C)
             v=p[:, 4],
             prev_close=float(prev_close),
             prev_ema=float(prev_ema),
-            half_life_bars=float(half_life_bars),
-        )
+            half_life_bars=float(half_life_bars))
         for name in out:
             out[name][k] = ohlcv[name]
     return out
 
 
 def apply_limit_projection(
-    ohlcv: Mapping[str, np.ndarray],
-    prev_close: float,
-    limit_rate: Optional[float],
+        ohlcv: Mapping[str, np.ndarray],
+        prev_close: float,
+        limit_rate: Optional[float],
 ) -> Dict[str, np.ndarray]:
     """Clamp O/H/L/C bar by bar to [pc*(1-rate), pc*(1+rate)], where pc is the previous projected close.
 
@@ -127,10 +119,8 @@ def _dist(samples: np.ndarray) -> Dict[str, np.ndarray]:
     return d
 
 
-def summarize_paths(
-    paths: Union[ArrayLike, Mapping[str, np.ndarray]],
-    prev_close: Optional[float] = None,
-) -> Dict[str, object]:
+def summarize_paths(paths: Union[ArrayLike, Mapping[str, np.ndarray]],
+                    prev_close: Optional[float] = None) -> Dict[str, object]:
     """Summarize a set of paths.
 
     paths is either denormalized features [K,Lh,5] or an OHLCV dict of [K,Lh] arrays.
@@ -144,7 +134,7 @@ def summarize_paths(
         realized_vol        per-path std of per-bar log returns (samples + quantiles)
     """
     if isinstance(paths, Mapping):
-        close = _to_numpy(paths["close"])                            # [K,Lh]
+        close = _to_numpy(paths["close"])  # [K,Lh]
         r = np.empty_like(close)
         if prev_close is not None:
             r[:, 0] = np.log(close[:, 0] / float(prev_close))
@@ -155,25 +145,23 @@ def summarize_paths(
         channel_bands = {name: _band(_to_numpy(paths[name]), axis=0)
                          for name in ("open", "high", "low", "close", "volume")}
     else:
-        arr = _to_numpy(paths)                                       # [K,Lh,5]
+        arr = _to_numpy(paths)  # [K,Lh,5]
         if arr.ndim != 3 or arr.shape[-1] != len(FEATURE_NAMES):
             raise ValueError(f"paths must be [K,Lh,5] or an ohlcv dict, got {arr.shape}")
         r = arr[:, :, 0] + arr[:, :, 1]  # close-to-close log return
         channel_bands = {name: _band(arr[:, :, j], axis=0)
                          for j, name in enumerate(FEATURE_NAMES)}
 
-    terminal = r.sum(axis=1)                                         # [K]
+    terminal = r.sum(axis=1)  # [K]
     # max drawdown of the cumulative log return, starting from 0
-    cum = np.cumsum(r, axis=1)                                       # [K,Lh]
+    cum = np.cumsum(r, axis=1)  # [K,Lh]
     run_max = np.maximum.accumulate(np.maximum(cum, 0.0), axis=1)
-    max_dd = (run_max - cum).max(axis=1)                             # [K]
+    max_dd = (run_max - cum).max(axis=1)  # [K]
     # 0 when Lh == 1
     rv = r.std(axis=1, ddof=1) if r.shape[1] > 1 else np.zeros(r.shape[0])
 
-    return {
-        "close_return_bands": _band(r, axis=0),
-        "channel_bands": channel_bands,
-        "terminal_return": _dist(terminal),
-        "max_drawdown": _dist(max_dd),
-        "realized_vol": _dist(rv),
-    }
+    return {"close_return_bands": _band(r, axis=0),
+            "channel_bands": channel_bands,
+            "terminal_return": _dist(terminal),
+            "max_drawdown": _dist(max_dd),
+            "realized_vol": _dist(rv)}
