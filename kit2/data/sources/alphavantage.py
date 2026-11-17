@@ -52,6 +52,9 @@ class AlphaVantage:
         self.n_requests = 0
         self.n_throttled = 0
         self.last_throttle_msg = ""
+        self.n_net_errors = 0
+        self.last_net_error = ""
+        self.busy_s = 0.0                # summed request wall time, for mean latency
 
     def _get(self, params: Dict[str, str], retries: int = 6) -> str:
         q = urllib.parse.urlencode({**params, "apikey": self.key})
@@ -59,12 +62,17 @@ class AlphaVantage:
         for attempt in range(retries):
             self.limiter.wait()
             self.n_requests += 1
+            t0 = time.monotonic()
             try:
-                with urllib.request.urlopen(f"{URL}?{q}", timeout=120) as r:
+                with urllib.request.urlopen(f"{URL}?{q}", timeout=60) as r:
                     body = r.read().decode("utf-8")
-            except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
                 err = repr(e)
+                self.n_net_errors += 1
+                self.last_net_error = err[:160]
+                self.busy_s += time.monotonic() - t0
             else:
+                self.busy_s += time.monotonic() - t0
                 if not body.lstrip().startswith("{"):
                     return body                              # CSV payload
                 msg = json.loads(body)

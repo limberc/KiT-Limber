@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 
 EXCHANGES = {"NYSE", "NASDAQ", "NYSE MKT", "AMEX", "BATS", "NYSE ARCA"}
-_SYMBOL = re.compile(r"^[A-Z]{1,5}(?:-[A-Z])?$")        # common + class shares (BRK-B); no warrants/units
+_SYMBOL = re.compile(r"^[A-Z]{1,5}(?:-[A-Z])?$")  # common + class shares (BRK-B); no warrants/units
 _NOT_COMMON = re.compile(r"warrant|\bunits?\b|\brights?\b|preferred|depositary|\bnotes?\b|%|"
                          r"acquisition corp|when issued", re.I)
 
@@ -62,14 +62,14 @@ def monthly_universe(daily: Dict[str, pd.DataFrame], windows: Dict[str, list], m
     (seasoning), a last close >= min_price, and a bar within `max_stale_days` before the month start.
     """
     months = pd.DatetimeIndex(sorted(months))
-    stats = []                                       # per symbol: (month idx array, adv, last close, last date)
+    stats = []  # per symbol: (month idx array, adv, last close, last date)
     for sym, df in daily.items():
         df = df[_in_windows(df["date"], windows.get(sym, [(pd.NaT, pd.NaT)]))]
         if len(df) < lookback:
             continue
         dates = df["date"].to_numpy()
         dv = (df["close"] * df["volume"]).rolling(lookback, min_periods=lookback).median().to_numpy()
-        idx = np.searchsorted(dates, months.to_numpy(), side="left") - 1    # last bar strictly before M
+        idx = np.searchsorted(dates, months.to_numpy()) - 1  # last bar strictly before M
         ok = idx >= 0
         for mi in np.flatnonzero(ok):
             i = idx[mi]

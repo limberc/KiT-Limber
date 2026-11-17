@@ -39,20 +39,24 @@ def run_jobs(name: str, jobs: Sequence, fn: Callable, workers: int, av: AlphaVan
 
     Progress reports requests/min over the last interval (skipped jobs cost no request)."""
     t0, done = time.time(), 0
-    t_last, req_last, thr_last = t0, av.n_requests, av.n_throttled
+    t_last, req_last, thr_last, err_last, busy_last = t0, av.n_requests, av.n_throttled, av.n_net_errors, av.busy_s
     log(f"[{name}] {len(jobs)} jobs")
     with ThreadPoolExecutor(workers) as ex:
         for _ in ex.map(fn, jobs):
             done += 1
-            if done % 200 == 0 or done == len(jobs):
+            if done % 100 == 0 or done == len(jobs):
                 now = time.time()
                 rpm = (av.n_requests - req_last) / max(now - t_last, 1e-9) * 60
                 jpm = done / max(now - t0, 1e-9) * 60
-                thr = av.n_throttled - thr_last
-                log(f"[{name}] {done}/{len(jobs)}  {rpm:.0f} req/min, {thr} throttled  "
+                thr, err = av.n_throttled - thr_last, av.n_net_errors - err_last
+                n_req = max(av.n_requests - req_last, 1)
+                log(f"[{name}] {done}/{len(jobs)}  {rpm:.0f} req/min, mean latency "
+                    f"{(av.busy_s - busy_last) / n_req:.1f}s, {thr} throttled, {err} net errors  "
                     f"ETA {(len(jobs) - done) / max(rpm, 1e-9) / 60:.1f}h"
-                    + (f"  last throttle: {av.last_throttle_msg[:120]!r}" if thr else ""))
-                t_last, req_last, thr_last = now, av.n_requests, av.n_throttled
+                    + (f"  last throttle: {av.last_throttle_msg[:120]!r}" if thr else "")
+                    + (f"  last error: {av.last_net_error!r}" if err else ""))
+                t_last, req_last, thr_last, err_last, busy_last = (now, av.n_requests, av.n_throttled,
+                                                                   av.n_net_errors, av.busy_s)
 
 
 class USDownloader:
