@@ -42,6 +42,7 @@ def synth_minutes(seed: int = 0, start="2024-05-13", end="2024-06-21") -> pd.Dat
     return pd.DataFrame(rows, columns=["ts_start", "open", "high", "low", "close", "volume"])
 
 
+MONTHS = list(pd.period_range("2024-05", "2024-06", freq="M"))   # download plan: known before each month
 SPLITS = pd.DataFrame({"effective_date": [SPLIT_DAY], "split_factor": [10.0]})
 DIVS = pd.DataFrame({"ex_dividend_date": [DIV_DAY], "amount": [0.4]})
 
@@ -73,19 +74,19 @@ def raw():
 
 @pytest.mark.parametrize("scale", ["1m", "5m", "30m", "1h", "2h"])
 def test_intraday_prefix_invariance(raw, scale):
-    full = build_intraday(raw, scale, SPLITS, DIVS)
+    full = build_intraday(raw, scale, MONTHS, SPLITS, DIVS)
     f_full = _features(full, scale)
     end = _end_utc(raw)
     assert (full["gap_adj"] != 0).sum() == 2                    # split + dividend, on their sessions only
     for t in _cuts(raw, 12, seed=hash(scale) % 1000):
-        trunc = build_intraday(raw[end <= t], scale, SPLITS, DIVS)
+        trunc = build_intraday(raw[end <= t], scale, MONTHS, SPLITS, DIVS)
         pd.testing.assert_frame_equal(_upto(full, t), _upto(trunc, t), check_exact=True)
         pd.testing.assert_frame_equal(_upto(f_full, t), _upto(_features(trunc, scale), t), check_exact=True)
 
 
 @pytest.mark.parametrize("scale", ["1m", "15m", "2h"])
 def test_intraday_future_perturbation(raw, scale):
-    full = build_intraday(raw, scale, SPLITS, DIVS)
+    full = build_intraday(raw, scale, MONTHS, SPLITS, DIVS)
     end = _end_utc(raw)
     rng = np.random.default_rng(1)
     for t in _cuts(raw, 6, seed=7):
@@ -95,7 +96,7 @@ def test_intraday_future_perturbation(raw, scale):
         for k in ("open", "high", "low", "close"):
             fake.loc[fut, k] = fake.loc[fut, k] * noise
         fake.loc[fut, "volume"] = rng.integers(1, 10**6, size=fut.sum()).astype(float)
-        pert = build_intraday(fake, scale, SPLITS, DIVS)
+        pert = build_intraday(fake, scale, MONTHS, SPLITS, DIVS)
         pd.testing.assert_frame_equal(_upto(full, t), _upto(pert, t), check_exact=True)
         pd.testing.assert_frame_equal(_upto(_features(full, scale), t), _upto(_features(pert, scale), t),
                                       check_exact=True)
@@ -103,7 +104,7 @@ def test_intraday_future_perturbation(raw, scale):
 
 def test_bar_stamped_at_close_uses_only_earlier_minutes(raw):
     """Every regular minute lands in the bar whose close is >= the minute's end, never an earlier bar."""
-    bars = build_intraday(raw, "30m", SPLITS, DIVS)
+    bars = build_intraday(raw, "30m", MONTHS, SPLITS, DIVS)
     end = _end_utc(raw).sort_values().to_numpy()
     ts = bars["ts"].to_numpy()
     # the bar at ts covers (ts - 30min, ts]; count minutes ending in that window must equal n_min

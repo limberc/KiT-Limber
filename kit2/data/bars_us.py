@@ -3,7 +3,9 @@
 Point-in-time contract (tested in kit2/tests/test_no_lookahead.py):
 - Alpha Vantage labels a 1-min bar by its START; a minute is available at start + 1 min.
 - A bar of scale S is stamped with its grid close `ts` and uses only minutes ending <= ts.
-- Missing minutes inside a covered session give flat bars at the previous close with zero volume.
+- Coverage (which months the stock is expected to trade) is an explicit input decided before the month
+  (universe membership + warm-up), never inferred from data that arrives later. Missing minutes inside a
+  covered session give flat bars at the previous close with zero volume.
 - `gap_adj` holds corporate actions effective on the bar's session (first bar only): ln(split factor)
   and -ln(1 - dividend / previous close). Raw prices are never back-adjusted.
 - Aux columns on the first bar of a session describe extended-hours trading that ended before the open.
@@ -11,7 +13,7 @@ Point-in-time contract (tested in kit2/tests/test_no_lookahead.py):
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Dict, Optional
+from typing import Dict, Iterable, Optional
 
 import numpy as np
 import pandas as pd
@@ -79,13 +81,14 @@ def minutes_utc(raw: pd.DataFrame) -> pd.DataFrame:
     return out.assign(end=out["start"] + pd.Timedelta(minutes=1)).sort_values("start").reset_index(drop=True)
 
 
-def build_intraday(raw: pd.DataFrame, scale: str, splits: Optional[pd.DataFrame] = None,
-                   divs: Optional[pd.DataFrame] = None) -> pd.DataFrame:
-    """raw: concatenated Alpha Vantage 1-min rows (ts_start, open, high, low, close, volume), extended hours."""
+def build_intraday(raw: pd.DataFrame, scale: str, months: Iterable[pd.Period],
+                   splits: Optional[pd.DataFrame] = None, divs: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """raw: concatenated Alpha Vantage 1-min rows (ts_start, open, high, low, close, volume), extended hours.
+    months: covered months (Period 'M') - the download plan for this symbol, known before each month."""
     step = INTRADAY_MIN[scale]
     m = minutes_utc(raw)
     if m.empty:
-        return pd.DataFrame(columns=BAR_COLS)
+        return _typed(pd.DataFrame(columns=BAR_COLS))
     cal = sessions()
     # session of each minute: the last session whose open <= start (extended minutes belong to that day's date)
     et_day = pd.DatetimeIndex(m["start"]).tz_localize("UTC").tz_convert(ET).tz_localize(None).normalize()
@@ -93,7 +96,7 @@ def build_intraday(raw: pd.DataFrame, scale: str, splits: Optional[pd.DataFrame]
     known = et_day.isin(cal_by_day.index)
     m, et_day = m[known].reset_index(drop=True), et_day[known]
     if m.empty:
-        return pd.DataFrame(columns=BAR_COLS)
+        return _typed(pd.DataFrame(columns=BAR_COLS))
     m["session"] = et_day.astype("datetime64[ns]")
     m["s_open"] = cal_by_day.loc[et_day, "open"].to_numpy()
     m["s_close"] = cal_by_day.loc[et_day, "close"].to_numpy()
@@ -102,10 +105,8 @@ def build_intraday(raw: pd.DataFrame, scale: str, splits: Optional[pd.DataFrame]
     pre = m[m["end"] <= m["s_open"]]
     post = m[m["start"] >= m["s_close"]]
 
-    # full grid of bars over the covered sessions (first .. last session with any regular minute)
-    covered = cal[(cal["session"] >= reg["session"].min()) & (cal["session"] <= reg["session"].max())]
-    covered = covered[covered["session"].isin(set(reg["session"]))
-                      | covered["session"].dt.to_period("M").isin(set(reg["session"].dt.to_period("M")))]
+    # full grid of bars over the covered months' sessions
+    covered = cal[cal["session"].dt.to_period("M").isin(set(pd.PeriodIndex(list(months), freq="M")))]
     n_bars = -(-covered["minutes"].to_numpy() // step)
     g_sess = np.repeat(covered["session"].to_numpy(), n_bars)
     g_j = np.concatenate([np.arange(n) for n in n_bars])
@@ -115,6 +116,8 @@ def build_intraday(raw: pd.DataFrame, scale: str, splits: Optional[pd.DataFrame]
     grid = pd.DataFrame({"session": g_sess, "j": g_j, "ts": g_ts})
     grid["sess_idx"] = np.repeat(cal.index[cal["session"].isin(covered["session"])].to_numpy(), n_bars)
 
+    if reg.empty or covered.empty:
+        return _typed(pd.DataFrame(columns=BAR_COLS))
     reg["j"] = ((reg["start"] - reg["s_open"]) // pd.Timedelta(minutes=1)).astype(int) // step
     agg = reg.groupby(["session", "j"]).agg(open=("open", "first"), high=("high", "max"), low=("low", "min"),
                                             close=("close", "last"), volume=("volume", "sum"),
