@@ -1,36 +1,9 @@
-"""Condition embeddings: global identity, timestep, and per-bar calendar."""
+"""Condition embeddings: global identity and per-bar calendar (timestep: diffusers, see layers.py)."""
 from __future__ import annotations
-
-import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
-class TimestepEmbedder(nn.Module):
-    """Embeds flow time t in [0,1]: sinusoidal(t*1000) -> Linear -> SiLU -> Linear."""
-
-    def __init__(self, t_emb_dim: int, d: int) -> None:
-        super().__init__()
-        self.t_emb_dim = t_emb_dim
-        self.fc1 = nn.Linear(t_emb_dim, d)
-        self.fc2 = nn.Linear(d, d)
-
-    @staticmethod
-    def sinusoidal(t: torch.Tensor, dim: int, max_period: float = 10000.0) -> torch.Tensor:
-        """t [B] -> [B, dim] sinusoidal features."""
-        half = dim // 2
-        freqs = torch.exp(
-            -math.log(max_period)
-            * torch.arange(half, dtype=torch.float32, device=t.device) / half)
-        args = t.float()[:, None] * freqs[None, :]
-        return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-
-    def forward(self, t: torch.Tensor) -> torch.Tensor:
-        """t [B] in [0,1] -> [B, d]."""
-        emb = self.sinusoidal(t * 1000.0, self.t_emb_dim).to(self.fc1.weight.dtype)
-        return self.fc2(F.silu(self.fc1(emb)))
 
 
 class CondEmbeddings(nn.Module):
@@ -45,7 +18,7 @@ class CondEmbeddings(nn.Module):
         self.market = nn.Embedding(market_slots, d)
         self.sector = nn.Embedding(sector_slots, d)
         self.scale = nn.Embedding(scale_slots, d)
-        self.inst = nn.Embedding(inst_vocab, inst_dim)       # low-rank instrument table
+        self.inst = nn.Embedding(inst_vocab, inst_dim)  # low-rank instrument table
         self.inst_proj = nn.Linear(inst_dim, d, bias=False)  # project to d
 
     def forward(self, market: torch.Tensor, sector: torch.Tensor,

@@ -15,9 +15,25 @@ from kit_v1.config import ModelConfig
 from kit_v1.model.adaln import SharedAdaLN
 from kit_v1.model.block import DiTBlock
 from kit_v1.model.embeddings import (CalendarEmbed, CondEmbeddings,
-                                        TimestepEmbedder, make_register_tokens,
-                                        make_role_embedding)
-from kit_v1.model.norms import RMSNorm
+                                     make_register_tokens, make_role_embedding)
+from kit_v1.model.layers import (RMSNorm, RotaryEmbedding, TimestepEmbedding,
+                                 Timesteps, llama_config, prepare_backend, resolve_backend)
+
+# checkpoints saved before the transformers/diffusers port: old -> new parameter names
+_LEGACY_RENAMES = (
+    (".mlp.w1.", ".mlp.gate_proj."), (".mlp.w3.", ".mlp.up_proj."), (".mlp.w2.", ".mlp.down_proj."),
+    ("t_emb.fc1.", "t_emb.linear_1."), ("t_emb.fc2.", "t_emb.linear_2."),
+)
+
+
+def convert_legacy_state_dict(state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Rename parameters of a pre-port checkpoint; new-style keys pass through unchanged."""
+    out = {}
+    for k, v in state.items():
+        for old, new in _LEGACY_RENAMES:
+            k = k.replace(old, new)
+        out[k] = v
+    return out
 
 
 class KlineDiT(nn.Module):
@@ -31,19 +47,21 @@ class KlineDiT(nn.Module):
         self.in_proj = nn.Linear(cfg.in_features, d)
         self.role_emb = make_role_embedding(d)
         self.register = make_register_tokens(cfg.n_registers, d)
-        self.calendar = CalendarEmbed(d, cfg.clock_dim, cfg.sess_hidden,
-                                      cfg.yday_dim)
+        self.calendar = CalendarEmbed(d, cfg.clock_dim, cfg.sess_hidden, cfg.yday_dim)
         self.cond_emb = CondEmbeddings(d, cfg.market_slots, cfg.sector_slots,
                                        cfg.scale_slots, cfg.inst_vocab, cfg.inst_dim)
-        self.t_emb = TimestepEmbedder(cfg.t_emb_dim, d)
+        # flow time t in [0,1] -> sinusoidal(t*1000) [cos|sin] -> Linear -> SiLU -> Linear
+        self.t_proj = Timesteps(cfg.t_emb_dim, flip_sin_to_cos=True, downscale_freq_shift=0)
+        self.t_emb = TimestepEmbedding(cfg.t_emb_dim, d)
         self.adaln = SharedAdaLN(d)
+        self.rotary = RotaryEmbedding(llama_config(d, cfg.n_heads, cfg.ffn_hidden, cfg.rope_theta))
         self.blocks = nn.ModuleList([
             DiTBlock(d, cfg.n_heads, cfg.ffn_hidden, qk_norm=cfg.qk_norm,
-                     rope_theta=cfg.rope_theta, backend=cfg.attn_backend)
+                     backend=cfg.attn_backend)
             for _ in range(cfg.n_layers)
         ])
         # output head
-        self.final_norm = RMSNorm(d, affine=False)
+        self.final_norm = RMSNorm(d, eps=1e-6, elementwise_affine=False)
         self.head_bias = nn.Parameter(torch.zeros(2 * d))
         self.out_proj = nn.Linear(d, cfg.in_features)
 
@@ -72,14 +90,21 @@ class KlineDiT(nn.Module):
         for blk in self.blocks:
             nn.init.zeros_(blk.bias_i)
 
-    def forward(
-        self,
-        z: torch.Tensor,
-        t: torch.Tensor,
-        cond: Dict[str, torch.Tensor],
-        Lh: int,
-        return_aux: bool = False,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
+    def set_attention_backend(self, backend: str) -> None:
+        """Pick the attention kernel for every block (any diffusers AttentionBackendName, or auto/sdpa/math/flash2)."""
+        name = resolve_backend(backend)
+        prepare_backend(name)
+        for blk in self.blocks:
+            blk.attn.backend = name
+
+    def _embed_t(self, t: torch.Tensor) -> torch.Tensor:
+        """t [B] in [0,1] -> [B,d]."""
+        return self.t_emb(self.t_proj(t * 1000.0).to(self.t_emb.linear_1.weight.dtype))
+
+    def forward(self,
+                z: torch.Tensor, t: torch.Tensor,
+                cond: Dict[str, torch.Tensor], Lh: int,
+                return_aux: bool = False, ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         """z [B,L,F] (clean ctx + noisy tgt); t [B] float in [0,1]; Lh = target length.
 
         cond: clock [B,L,16], sess [B,L,2], yday [B,L,8] float;
@@ -91,49 +116,47 @@ class KlineDiT(nn.Module):
         Lc = L - Lh
         n_reg = self.cfg.n_registers
         device = z.device
-
+        # no pad_mask = every token valid; attention then runs unmasked on the selected backend
         pad_mask: Optional[torch.Tensor] = cond.get("pad_mask")
-        if pad_mask is None:
-            pad_mask = torch.ones(B, L, dtype=torch.bool, device=device)
 
         role_tok = torch.cat([
             torch.zeros(Lc, dtype=torch.long, device=device),
             torch.ones(Lh, dtype=torch.long, device=device),
-        ]).unsqueeze(0).expand(B, -1)                                   # [B,L]
+        ]).unsqueeze(0).expand(B, -1)  # [B,L]
 
         tok = (self.in_proj(z) + self.role_emb(role_tok)
                + self.calendar(cond["clock"], cond["sess"],
                                cond["dow"], cond["event"],
-                               cond["month"], cond["yday"]))            # [B,L,d]
+                               cond["month"], cond["yday"]))  # [B,L,d]
 
-        reg = self.register.unsqueeze(0).expand(B, -1, -1)              # [B,n_reg,d]
-        x = torch.cat([reg, tok], dim=1)                                # [B,n_reg+L,d]
+        reg = self.register.unsqueeze(0).expand(B, -1, -1)  # [B,n_reg,d]
+        x = torch.cat([reg, tok], dim=1)  # [B,n_reg+L,d]
         full_role = torch.cat([
             torch.zeros(B, n_reg, dtype=torch.long, device=device), role_tok,
-        ], dim=1)                                                       # [B,n_reg+L]
-        full_pad = torch.cat([
+        ], dim=1)  # [B,n_reg+L]
+        full_pad = None if pad_mask is None else torch.cat([
             torch.ones(B, n_reg, dtype=torch.bool, device=device), pad_mask,
-        ], dim=1)                                                       # [B,n_reg+L]
-        positions = torch.arange(n_reg + L, device=device)              # RoPE uses assembled indices
+        ], dim=1)  # [B,n_reg+L]
+        rotary = self.rotary(n_reg + L, device)  # RoPE over assembled indices
 
         c_base = self.cond_emb(cond["market"], cond["sector"],
-                               cond["inst"], cond["scale"])             # [B,d]
-        c_mod_tgt, head_mod = self.adaln(self.t_emb(t), c_base)
-        c_mod_ctx, _ = self.adaln(self.t_emb(torch.zeros_like(t)), c_base)
+                               cond["inst"], cond["scale"])  # [B,d]
+        c_mod_tgt, head_mod = self.adaln(self._embed_t(t), c_base)
+        c_mod_ctx, _ = self.adaln(self._embed_t(torch.zeros_like(t)), c_base)
 
         for blk in self.blocks:
             if self.cfg.use_activation_checkpointing and self.training:
                 x = torch.utils.checkpoint.checkpoint(
-                    blk, x, c_mod_ctx, c_mod_tgt, full_role, full_pad, positions,
+                    blk, x, c_mod_ctx, c_mod_tgt, full_role, full_pad, rotary,
                     use_reentrant=False)
             else:
-                x = blk(x, c_mod_ctx, c_mod_tgt, full_role, full_pad, positions)
+                x = blk(x, c_mod_ctx, c_mod_tgt, full_role, full_pad, rotary)
 
-        x_tgt = x[:, n_reg + Lc:, :]                                    # [B,Lh,d]
+        x_tgt = x[:, n_reg + Lc:, :]  # [B,Lh,d]
         shift_f, scale_f = (head_mod + self.head_bias).chunk(2, dim=-1)  # each [B,d]
         h = (self.final_norm(x_tgt) * (1 + scale_f.unsqueeze(1))
              + shift_f.unsqueeze(1))
-        v_pred = self.out_proj(h)                                       # [B,Lh,F]
+        v_pred = self.out_proj(h)  # [B,Lh,F]
 
         if return_aux:
             return v_pred, {"c_mod_ctx": c_mod_ctx, "c_mod_tgt": c_mod_tgt,

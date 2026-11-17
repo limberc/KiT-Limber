@@ -196,7 +196,9 @@ class ModelConfig:
     sess_hidden: int = 256          # in-session position MLP hidden size
     yday_dim: int = 8               # day-of-year Fourier dim (sin/cos for k=1..4)
     qk_norm: bool = True
-    attn_backend: str = "auto"      # auto | flash2 | sdpa | math
+    # attention kernel: any diffusers AttentionBackendName (native, _native_cudnn, flash, flash_hub,
+    # sage, flex, ...); legacy auto/sdpa -> native, math -> _native_math, flash2 -> flash
+    attn_backend: str = "auto"
     use_activation_checkpointing: bool = False
 
 

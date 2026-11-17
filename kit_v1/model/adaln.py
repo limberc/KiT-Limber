@@ -14,8 +14,8 @@ class SharedAdaLN(nn.Module):
     def __init__(self, d: int) -> None:
         super().__init__()
         self.w1 = nn.Linear(d, d)
-        self.w2 = nn.Linear(d, 6 * d)        # shift1, scale1, gate1, shift2, scale2, gate2
-        self.w_head = nn.Linear(d, 2 * d)    # final shift, scale
+        self.w2 = nn.Linear(d, 6 * d)  # shift1, scale1, gate1, shift2, scale2, gate2
+        self.w_head = nn.Linear(d, 2 * d)  # final shift, scale
         # zero init so blocks start as identity
         nn.init.zeros_(self.w2.weight)
         nn.init.zeros_(self.w2.bias)

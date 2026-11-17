@@ -78,7 +78,7 @@ def load_frames(data_root: Path, codes: list[str], scale: str,
 
 
 def run_anchor(model, frames, instruments, codes, scale, anchor, Lc, Lh, stats, cfg,
-               tdays, val_hi, k_paths, steps, chunk, seed, device):
+               tdays, val_hi, k_paths, steps, chunk, seed, device, unmask=False):
     from kit_v1.infer import denormalize_paths, flow_sample, prepare_inference_window
 
     end = pd.Timestamp(anchor) + pd.Timedelta(hours=15)
@@ -117,6 +117,8 @@ def run_anchor(model, frames, instruments, codes, scale, anchor, Lc, Lh, stats, 
     x = torch.cat([w["x_ctx"] for _, w, _, _ in wins], dim=0)
     cond = {k: torch.cat([w["cond"][k] for _, w, _, _ in wins], dim=0)
             for k in wins[0][1]["cond"]}
+    if unmask and bool(cond["pad_mask"].all()):
+        del cond["pad_mask"]                # every window has full history: same maths, no dense mask
     paths = flow_sample(
         model, x, cond, Lh=Lh, steps=int(steps), solver="euler", n_paths=int(k_paths),
         generator=torch.Generator().manual_seed(int(seed)), device=device,
@@ -183,6 +185,14 @@ def main() -> None:
     ap.add_argument("--shard", default="0/1",
                     help="shard i/n: split all anchor jobs into n cost-balanced parts; this process runs only part i (for multi-GPU)")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--compile", action="store_true",
+                    help="torch.compile the model and drop the attention mask when no window is padded "
+                         "(same maths, ~2x faster; outputs differ at bf16 rounding level)")
+    ap.add_argument("--attn-backend", default="",
+                    help="diffusers attention backend (native, _native_cudnn, _native_flash, flash, flash_hub, "
+                         "sage, ...); empty = the checkpoint config's choice")
+    ap.add_argument("--hub-kernels", action="store_true",
+                    help="swap RMSNorm / SwiGLU MLP for Hugging Face hub kernels (Liger) via `kernels`")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
@@ -211,6 +221,15 @@ def main() -> None:
     t0 = time.time()
     model, cfg = load_model_and_config(str(args.ckpt), "tiny", args.seed)
     model.to(device).eval()
+    if args.attn_backend:
+        model.set_attention_backend(args.attn_backend)
+    if args.hub_kernels:
+        from kit_v1.model.layers import kernelize_hub
+        kernelize_hub(model, compile=args.compile, device=device.type)
+    if args.compile:
+        # one graph per (scale, batch) shape; the cache is reset at every scale switch below
+        torch._dynamo.config.recompile_limit = 64
+        model = torch.compile(model, dynamic=False)
     stats = load_stats(data_root / "stats.json")
     tdays = load_trading_days(data_root / "trade_dates.csv")
     if tdays is None:
@@ -254,6 +273,8 @@ def main() -> None:
         "val_lo": args.val_lo, "val_hi": args.val_hi, "anchor_stride": args.anchor_stride,
         "k_paths": K, "steps": S, "solver": "euler", "precision": "bf16",
         "seed": args.seed, "train_end": cfg.data.train_end, "val_start": cfg.data.val_start,
+        "compile": bool(args.compile), "attn_backend": args.attn_backend or cfg.model.attn_backend,
+        "hub_kernels": bool(args.hub_kernels),
         "n_jobs_this_shard": len(jobs), "shard": args.shard, "device": str(device),
         "device_type": device.type,
     }, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -277,10 +298,12 @@ def main() -> None:
             print(f"load {scale} keep_bars={keep} codes={len(codes)}", flush=True)
             frames = load_frames(data_root, codes, scale, earliest, keep)
             loaded_scale = scale
+            if args.compile:
+                torch._dynamo.reset()
         seed = args.seed + 10007 * (SCALES.index(scale) + 1) + ai
         t1 = time.time()
         row = run_anchor(model, frames, instruments, codes, scale, anchor, Lc, Lh, stats, cfg,
-                         tdays, args.val_hi, K, S, args.chunk, seed, device)
+                         tdays, args.val_hi, K, S, args.chunk, seed, device, unmask=args.compile)
         if row is None:
             print(f"[{ji}/{len(jobs)}] {scale} {anchor} no valid samples, skipped", flush=True)
             continue

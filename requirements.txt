@@ -1,4 +1,7 @@
 torch>=2.4
+transformers>=5.23   # Llama RMSNorm / SwiGLU MLP / RoPE layers
+diffusers>=0.43     # timestep embedding, attention backend dispatch
+kernels             # optional: hub kernels (Liger RMSNorm/SwiGLU, flash/sage attention)
 numpy
 pandas
 pyarrow

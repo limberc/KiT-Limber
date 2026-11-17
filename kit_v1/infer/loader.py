@@ -8,6 +8,7 @@ import torch
 
 from kit_v1.config import Config, get_config
 from kit_v1.model import KlineDiT
+from kit_v1.model.dit import convert_legacy_state_dict
 
 
 def load_model_and_config(
@@ -42,10 +43,10 @@ def load_model_and_config(
     if ema:
         # accept either {"shadow": {...}} or a flat param dict
         shadow = ema["shadow"] if isinstance(ema, dict) and "shadow" in ema else ema
-        state.update({k: v.to(torch.float32) for k, v in shadow.items()})
+        state.update({k: v.to(torch.float32) for k, v in convert_legacy_state_dict(shadow).items()})
         print(f"[info] loaded EMA weights (step={ckpt.get('step')})")
     else:
-        state.update(ckpt["model"])
+        state.update(convert_legacy_state_dict(ckpt["model"]))
         print(f"[warn] checkpoint has no ema key, falling back to model weights (step={ckpt.get('step')})")
     model.load_state_dict(state)
     return model, cfg
