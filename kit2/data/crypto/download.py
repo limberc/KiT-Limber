@@ -28,8 +28,8 @@ import numpy as np
 import pandas as pd
 
 from kit2.data.io import atomic_write_parquet
-from kit2.data.sources import Dex, CHAINS
 from kit2.env import data_root
+from .hypersync_dex import Dex, CHAINS
 
 START = {"eth": "2023-01-01", "base": "2023-08-01", "arbitrum": "2023-01-01"}
 SAMPLE_DAYS = (1, 15)  # one-day windows starting this many days before the month start
@@ -108,7 +108,7 @@ class CryptoDownloader:
 
     def _approx_block(self, blk: pd.Series, t: pd.Timestamp) -> int:
         """Block at time t, linearly interpolated between exact month anchors (for sampling windows)."""
-        x = blk.index.as_unit("ns").asi8.astype(np.float64)    # pandas 3 may store datetime64[us]
+        x = blk.index.as_unit("ns").asi8.astype(np.float64)  # pandas 3 may store datetime64[us]
         return int(np.interp(float(pd.Timestamp(t).as_unit("ns").value), x, blk.to_numpy(np.float64)))
 
     # ---- activity ------------------------------------------------------------------------------

@@ -18,22 +18,12 @@ from typing import Dict, Iterable, Optional
 import numpy as np
 import pandas as pd
 
+from kit2.data.bars_core import CORE_COLS, SCALE_SECONDS, empty, fill_flat, ohlc, segments, typed
+
 ET = "America/New_York"
-INTRADAY_MIN = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "2h": 120}
-BAR_COLS = ["ts", "session", "open", "high", "low", "close", "volume", "dvol", "n_min", "gap_adj", "seg",
-            "aux_pre_ret", "aux_post_ret", "aux_pre_ldv", "aux_post_ldv"]
-
-
-def _typed(bars: pd.DataFrame) -> pd.DataFrame:
-    """Fixed column order and dtypes, so the output never depends on which rows happened to be missing."""
-    out = bars[BAR_COLS].reset_index(drop=True)
-    out["ts"] = out["ts"].astype("datetime64[ns]")
-    out["session"] = out["session"].astype("datetime64[ns]")
-    out["seg"] = out["seg"].astype(np.int64)
-    for c in BAR_COLS[2:]:
-        if c != "seg":
-            out[c] = out[c].astype(np.float64)
-    return out
+INTRADAY_MIN = {k: s // 60 for k, s in SCALE_SECONDS.items() if k != "1d"}
+AUX_COLS = ("aux_pre_ret", "aux_post_ret", "aux_pre_ldv", "aux_post_ldv")
+BAR_COLS = ["ts", "session", *CORE_COLS[1:], *AUX_COLS]
 
 
 @lru_cache(maxsize=4)
@@ -67,12 +57,6 @@ def _corp_adjust(sess_first: pd.DataFrame, prev_close: np.ndarray, splits: Optio
     return adj
 
 
-def _segments(sess_idx: np.ndarray) -> np.ndarray:
-    """New segment wherever consecutive bars skip a trading session (a data gap)."""
-    jump = np.r_[False, np.diff(sess_idx) > 1]
-    return np.cumsum(jump)
-
-
 def minutes_utc(raw: pd.DataFrame) -> pd.DataFrame:
     """Alpha Vantage 1-min rows (ts_start, US/Eastern naive) -> start/end as naive UTC."""
     start = (pd.DatetimeIndex(raw["ts_start"]).tz_localize(ET, ambiguous="NaT", nonexistent="NaT")
@@ -88,7 +72,7 @@ def build_intraday(raw: pd.DataFrame, scale: str, months: Iterable[pd.Period],
     step = INTRADAY_MIN[scale]
     m = minutes_utc(raw)
     if m.empty:
-        return _typed(pd.DataFrame(columns=BAR_COLS))
+        return empty(BAR_COLS)
     cal = create_cal()
     # session of each minute: the last session whose open <= start (extended minutes belong to that day's date)
     et_day = pd.DatetimeIndex(m["start"]).tz_localize("UTC").tz_convert(ET).tz_localize(None).normalize()
@@ -96,7 +80,7 @@ def build_intraday(raw: pd.DataFrame, scale: str, months: Iterable[pd.Period],
     known = et_day.isin(cal_by_day.index)
     m, et_day = m[known].reset_index(drop=True), et_day[known]
     if m.empty:
-        return _typed(pd.DataFrame(columns=BAR_COLS))
+        return empty(BAR_COLS)
     m["session"] = et_day.astype("datetime64[ns]")
     m["s_open"] = cal_by_day.loc[et_day, "open"].to_numpy()
     m["s_close"] = cal_by_day.loc[et_day, "close"].to_numpy()
@@ -117,21 +101,15 @@ def build_intraday(raw: pd.DataFrame, scale: str, months: Iterable[pd.Period],
     grid["sess_idx"] = np.repeat(cal.index[cal["session"].isin(covered["session"])].to_numpy(), n_bars)
 
     if reg.empty or covered.empty:
-        return _typed(pd.DataFrame(columns=BAR_COLS))
+        return empty(BAR_COLS)
     reg["j"] = ((reg["start"] - reg["s_open"]) // pd.Timedelta(minutes=1)).astype(int) // step
-    agg = reg.groupby(["session", "j"]).agg(open=("open", "first"), high=("high", "max"), low=("low", "min"),
-                                            close=("close", "last"), volume=("volume", "sum"),
-                                            dvol=("dvol", "sum"), n_min=("open", "size")).reset_index()
+    agg = reg.groupby(["session", "j"]).agg(**ohlc(), volume=("volume", "sum"), dvol=("dvol", "sum"),
+                                            n_min=("open", "size")).reset_index()
     bars = grid.merge(agg, on=["session", "j"], how="left")
-    has = bars["n_min"].notna().to_numpy()
-    first_real = int(np.argmax(has))
-    bars = bars.iloc[first_real:].reset_index(drop=True)
-    close = bars["close"].ffill()
-    for k in ("open", "high", "low"):
-        bars[k] = bars[k].fillna(close)
-    bars["close"] = close
-    bars[["volume", "dvol", "n_min"]] = bars[["volume", "dvol", "n_min"]].fillna(0.0)
-    bars["seg"] = _segments(bars["sess_idx"].to_numpy())
+    bars = fill_flat(bars, ("volume", "dvol", "n_min"), segments(bars["sess_idx"].to_numpy()))
+    if bars is None:
+        return empty(BAR_COLS)
+    bars = bars.reset_index(drop=True)
 
     # session-level: previous regular close, corporate actions, extended-hours aux (all known before the open)
     first = bars.groupby("session").head(1).index
@@ -146,13 +124,13 @@ def build_intraday(raw: pd.DataFrame, scale: str, months: Iterable[pd.Period],
     pre_last = sess_first["session"].map(pre_s["pre_last"]).to_numpy(np.float64)
     post_last = prev_sess.map(post_s["post_last"]).to_numpy(np.float64)
     split_now = np.exp(bars.loc[first, "gap_adj"].to_numpy())          # rescale post-market of the day before
-    for col in BAR_COLS[11:]:
+    for col in AUX_COLS:
         bars[col] = np.nan
     bars.loc[first, "aux_post_ret"] = np.log(post_last / prev_close)
     bars.loc[first, "aux_pre_ret"] = np.log(pre_last * split_now / prev_close)
     bars.loc[first, "aux_pre_ldv"] = np.log1p(sess_first["session"].map(pre_s["pre_dv"]).fillna(0.0).to_numpy())
     bars.loc[first, "aux_post_ldv"] = np.log1p(prev_sess.map(post_s["post_dv"]).fillna(0.0).to_numpy())
-    return _typed(bars)
+    return typed(bars, BAR_COLS)
 
 
 def build_daily(daily: pd.DataFrame, splits: Optional[pd.DataFrame] = None,
@@ -167,15 +145,15 @@ def build_daily(daily: pd.DataFrame, splits: Optional[pd.DataFrame] = None,
     bars["dvol"] = bars["close"] * bars["volume"]
     bars["n_min"] = np.nan
     sess_idx = cal.index[cal["session"].isin(d["session"])].to_numpy()
-    bars["seg"] = _segments(sess_idx)
+    bars["seg"] = segments(sess_idx)
     bars["gap_adj"] = _corp_adjust(bars[["session"]], bars["close"].shift(1).to_numpy(), splits, divs)
-    for col in BAR_COLS[11:]:
+    for col in AUX_COLS:
         bars[col] = np.nan
-    return _typed(bars)
+    return typed(bars, BAR_COLS)
 
 
 def bars_per_day(scale: str) -> int:
     return 1 if scale == "1d" else -(-390 // INTRADAY_MIN[scale])
 
 
-SCALES: Dict[str, int] = {**INTRADAY_MIN, "1d": 1440}
+SCALES: Dict[str, int] = {k: s // 60 for k, s in SCALE_SECONDS.items()}   # minutes

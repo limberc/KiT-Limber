@@ -18,10 +18,11 @@ from typing import Dict, Iterable, Optional
 import numpy as np
 import pandas as pd
 
+from kit2.data.bars_core import CORE_COLS, SCALE_SECONDS, empty, fill_flat, ohlc, segments, typed
+
 LN10 = float(np.log(10.0))
-STEP_S = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "2h": 7200, "1d": 86400}
-BAR_COLS = ["ts", "open", "high", "low", "close", "volume", "dvol", "n_min", "gap_adj", "seg",
-            "aux_flow_imb", "aux_ln_traders", "aux_ln_gas", "aux_ln_liq"]
+AUX_COLS = ("aux_flow_imb", "aux_ln_traders", "aux_ln_gas", "aux_ln_liq")
+BAR_COLS = [*CORE_COLS, *AUX_COLS]
 
 
 def block_end(sw: pd.DataFrame) -> pd.DataFrame:
@@ -56,16 +57,16 @@ def build_token_bars(swaps: pd.DataFrame, pools: pd.DataFrame, primary: Dict[pd.
                      months: Iterable[pd.Period], refs: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     """swaps: decoded swaps of the token's pools (any order); pools: oriented rows (pool, quote_is_token0,
     quote_kind, quote_dec); primary: month -> primary pool; refs: quote_kind ('eth'/'btc') -> reference series."""
-    step = STEP_S[scale]
+    step = SCALE_SECONDS[scale]
     months = sorted(set(pd.PeriodIndex(list(months), freq="M")))
     if swaps.empty or not months:
-        return _typed(pd.DataFrame(columns=BAR_COLS))
+        return empty(BAR_COLS)
     sw = swaps.merge(pools[["pool", "quote_is_token0", "quote_kind", "quote_dec"]], on="pool", how="inner")
     sw = sw.sort_values(["block", "log_index"]).reset_index(drop=True)
     sw["month"] = pd.to_datetime(sw["ts"], unit="s").dt.to_period("M")
     sw = sw[sw["month"].isin(months)]
     if sw.empty:
-        return _typed(pd.DataFrame(columns=BAR_COLS))
+        return empty(BAR_COLS)
 
     # USD conversion: ln(USD per quote human unit) as of each swap's block
     lp_ref = np.zeros(len(sw))
@@ -86,8 +87,7 @@ def build_token_bars(swaps: pd.DataFrame, pools: pd.DataFrame, primary: Dict[pd.
     lp = (base_quote_lp(prim["log_price"].to_numpy(), prim["quote_is_token0"].to_numpy())
           - LN10 * prim["quote_dec"].to_numpy() + prim["lp_ref"].to_numpy() + 18 * LN10)
     ev = pd.DataFrame({"bar": prim["bar"].to_numpy(), "px": np.exp(lp), "liq": prim["liquidity"].to_numpy()})
-    px = ev.groupby("bar").agg(open=("px", "first"), high=("px", "max"), low=("px", "min"),
-                               close=("px", "last"), liq=("liq", "last"))
+    px = ev.groupby("bar").agg(**ohlc("px", "px", "px", "px"), liq=("liq", "last"))
     flow = sw.groupby("bar").agg(dvol=("usd", "sum"), buy=("buy_usd", "sum"), n_min=("usd", "size"),
                                  traders=("tx_from", "nunique"), gas=("base_fee_gwei", "median"))
 
@@ -97,37 +97,19 @@ def build_token_bars(swaps: pd.DataFrame, pools: pd.DataFrame, primary: Dict[pd.
     grid = np.arange(lo + step, hi + 1, step, dtype=np.int64)
     gm = pd.to_datetime(grid - 1, unit="s").to_period("M")
     grid = grid[gm.isin(months)]
+    month_ord = pd.to_datetime(grid - 1, unit="s").to_period("M").asi8      # calendar month number per bar
     bars = pd.DataFrame(index=pd.Index(grid, name="bar")).join(px).join(flow)
-    has = bars["close"].notna().to_numpy()
-    if not has.any():
-        return _typed(pd.DataFrame(columns=BAR_COLS))
-    bars = bars.iloc[int(np.argmax(has)):]
-    close = bars["close"].ffill()
-    for k in ("open", "high", "low"):
-        bars[k] = bars[k].fillna(close)
-    bars["close"] = close
-    bars[["dvol", "buy", "n_min"]] = bars[["dvol", "buy", "n_min"]].fillna(0.0)
+    bars = fill_flat(bars, ("dvol", "buy", "n_min"), segments(month_ord))
+    if bars is None:
+        return empty(BAR_COLS)
     bars["volume"] = bars["dvol"]
     bars["gap_adj"] = 0.0
-    bar_month = pd.to_datetime(bars.index.to_numpy() - 1, unit="s").to_period("M")
-    month_idx = np.array([months.index(m) for m in bar_month])
-    bars["seg"] = np.cumsum(np.r_[False, np.diff(month_idx) > 1])
     bars["aux_flow_imb"] = np.where(bars["dvol"] > 0, (2 * bars["buy"] - bars["dvol"]) / bars["dvol"], 0.0)
     bars["aux_ln_traders"] = np.log1p(bars["traders"].fillna(0.0))
     bars["aux_ln_gas"] = np.log(bars["gas"]).where(bars["gas"] > 0)
     bars["aux_ln_liq"] = np.log(bars["liq"].ffill()).where(bars["liq"].ffill() > 0)
     bars["ts"] = pd.to_datetime(bars.index.to_numpy(), unit="s")
-    return _typed(bars.reset_index(drop=True))
-
-
-def _typed(bars: pd.DataFrame) -> pd.DataFrame:
-    out = bars.reindex(columns=BAR_COLS).reset_index(drop=True)
-    out["ts"] = out["ts"].astype("datetime64[ns]")
-    out["seg"] = out["seg"].astype(np.int64)
-    for c in BAR_COLS[1:]:
-        if c != "seg":
-            out[c] = out[c].astype(np.float64)
-    return out
+    return typed(bars, BAR_COLS)
 
 
 def primary_pools(activity: Dict[pd.Period, pd.DataFrame], token_pools: Iterable[str],

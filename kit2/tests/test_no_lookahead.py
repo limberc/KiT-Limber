@@ -233,3 +233,28 @@ def test_crypto_usd_price_is_consistent_across_quote_pools(crypto):
     gap = np.log(bars["open"].iloc[i] / bars["close"].iloc[i - 1])
     assert abs(gap) < 0.01, gap
     assert 0.3 < bars["close"].iloc[i] / 1.0 < 1.0                # X starts near 0.5 USD
+
+
+# ---- shared bar helpers ------------------------------------------------------------------------------
+from kit2.data.bars_core import fill_flat, segments  # noqa: E402
+
+
+def test_fill_flat_never_carries_a_price_across_a_gap():
+    bars = pd.DataFrame({"open": [1.0, np.nan, 2.0, np.nan, np.nan, 3.0],
+                         "high": [1.0, np.nan, 2.0, np.nan, np.nan, 3.0],
+                         "low": [1.0, np.nan, 2.0, np.nan, np.nan, 3.0],
+                         "close": [1.0, np.nan, 2.0, np.nan, np.nan, 3.0],
+                         "dvol": [5.0, np.nan, 5.0, np.nan, np.nan, 5.0]})
+    seg = segments(np.array([10, 10, 11, 13, 13, 14]))              # period 12 skipped -> new segment at row 3
+    out = fill_flat(bars, ["dvol"], seg)
+    assert list(out.index) == [0, 1, 2, 5]                          # rows 3-4: unpriced start of a new segment
+    assert out["close"].tolist() == [1.0, 1.0, 2.0, 3.0] and out.loc[1, "dvol"] == 0.0
+    assert out["seg"].tolist() == [0, 0, 0, 1]
+
+
+def test_crypto_coverage_gap_starts_a_new_segment(crypto):
+    tok, ref, pools = crypto
+    jan_mar = [pd.Period("2025-01", "M"), pd.Period("2025-03", "M")]   # February not covered; no March swaps
+    bars = build_token_bars(tok, pools, {jan_mar[0]: "usdc_x"}, "1h", jan_mar,
+                            {"eth": reference_series(ref, quote_is_token0=True, base_dec=18, quote_dec=6)})
+    assert bars["ts"].max() <= pd.Timestamp("2025-02-01")           # no stale flat bars invented for March
