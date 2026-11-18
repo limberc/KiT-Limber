@@ -1,17 +1,20 @@
 """Resumable on-chain DEX downloader (Envio HyperSync, Uniswap v3 pools). One chain per process.
 
-Usage: python -m kit2.data.download_crypto --chain eth [--phases pools,activity,candidates,swaps]
+Usage: python -m kit2.data.download_crypto --chain eth [--phases pools,anchors,activity,candidates,swaps]
 
 Layout under <data_root>/raw/crypto/<chain>/:
-  pools.parquet                      every Uniswap v3 pool: pool, token0, token1, fee, tick_spacing, block
-  activity/blk_<from>_<to>_{act,days}.parquet  per-chunk swap counts per (pool, UTC day) + day blocks
-  activity_daily.parquet             merged counts + day_blocks.parquet (first block of each UTC day)
-  candidates_monthly.parquet         point-in-time candidate pools per month (selection uses days < month)
-  swaps/<YYYY-MM>.parquet            decoded swaps of the month's download set, ordered by (block, log_index)
+  pools.parquet                every Uniswap v3 pool: pool, token0, token1, fee, tick_spacing, block (created)
+  month_blocks.parquet         first block at/after each month start (UTC), found by timestamp search
+  activity/<YYYY-MM>.parquet   swap counts per pool over one-day sample windows before that month
+  candidates_monthly.parquet   point-in-time candidate pools per month
+  swaps/<YYYY-MM>.parquet      decoded swaps of the month's download set, ordered by (block, log_index)
 
-Point-in-time rule: candidates for month M are ranked on swap counts from complete UTC days before M.
-The download set may look ahead (a pool that becomes a candidate later is fetched early, so its history
-exists); which bytes we fetch never feeds a feature or a selection.
+Point-in-time rule: candidates for month M are ranked on activity sampled from days before M and on pool
+creation blocks before M. The download set may look ahead (a pool that becomes a candidate later is fetched
+early so its history exists); which bytes we fetch never feeds a feature or a selection.
+
+Budget: the HyperSync token allows ~100 requests/min and a response holds ~6.5k logs (~11k logs/s), so the
+ranking samples SAMPLE_DAYS one-day windows per month instead of scanning every day.
 """
 from __future__ import annotations
 
@@ -25,16 +28,15 @@ import numpy as np
 import pandas as pd
 
 from kit2.data.io import atomic_write_parquet
-from kit2.data.sources.hypersync_dex import CHAINS, Dex
+from kit2.data.sources import Dex, CHAINS
 from kit2.env import data_root
 
-# blocks per activity chunk (~1 month of blocks at each chain's typical block time)
-CHUNK_BLOCKS = {"eth": 216_000, "base": 1_296_000, "arbitrum": 10_000_000}
-TRAIL_DAYS = 30  # candidate ranking window (complete days before the month)
-SEASON_DAYS = 30  # a pool must have been active this long before it can be a candidate
-N_TOKENS = 150  # candidate base tokens per chain per month
-POOLS_PER_TOKEN = 3  # most active pools kept per base token
-LOOKAHEAD_MONTHS = 9  # download history this far before a pool's first candidate month (1d scale: 250 days)
+START = {"eth": "2023-01-01", "base": "2023-08-01", "arbitrum": "2023-01-01"}
+SAMPLE_DAYS = (1, 15)  # one-day windows starting this many days before the month start
+SEASON_DAYS = 30  # a pool must have been created this long before the month
+N_TOKENS = 100  # candidate base tokens per chain per month
+POOLS_PER_TOKEN = 2  # most active pools kept per base token
+LOOKAHEAD_MONTHS = 9  # history fetched before a pool's first candidate month (1d scale: 250 days)
 
 
 def log(msg: str) -> None:
@@ -63,6 +65,7 @@ class CryptoDownloader:
         self.chain = chain
         self.root = root / "raw" / "crypto" / chain
         self.dex = Dex(chain)
+        self.months = pd.date_range(START[chain], pd.Timestamp.now().normalize(), freq="MS")
 
     # ---- pools ---------------------------------------------------------------------------------
     def pools(self) -> None:
@@ -71,63 +74,82 @@ class CryptoDownloader:
         atomic_write_parquet(df, out)
         log(f"[pools] {len(df)} pools")
 
+    # ---- month anchors -------------------------------------------------------------------------
+    def anchors(self) -> None:
+        """Exact first block of every month start (one month before START too, for interpolation)."""
+        out = self.root / "month_blocks.parquet"
+        have = pd.read_parquet(out) if out.is_file() else pd.DataFrame({"ts": [], "block": []})
+        done = set(pd.to_datetime(have["ts"]))
+        want = [m for m in [self.months[0] - pd.DateOffset(months=1), *self.months] if m not in done]
+
+        async def run():
+            height = await self.dex.height()
+            known = sorted(zip(pd.to_datetime(have["ts"]), have["block"].astype(int)))
+            rows = []
+            for t in want:
+                lo = max([b for tt, b in known if tt <= t], default=CHAINS[self.chain].factory_block)
+                hi = min([b for tt, b in known if tt >= t], default=height)
+                b = await self.dex.block_at(int(t.timestamp()), lo, hi)
+                rows.append((t, b))
+                known = sorted(known + [(t, b)])
+            return rows
+
+        t0 = time.time()
+        rows = asyncio.run(run())
+        allb = pd.concat([have, pd.DataFrame(rows, columns=["ts", "block"])], ignore_index=True)
+        allb["ts"] = pd.to_datetime(allb["ts"])
+        allb["block"] = allb["block"].astype(np.int64)
+        atomic_write_parquet(allb.sort_values("ts").reset_index(drop=True), out)
+        log(f"[anchors] {len(rows)} month anchors in {time.time() - t0:.0f}s")
+
+    def _blocks(self) -> pd.Series:
+        b = pd.read_parquet(self.root / "month_blocks.parquet")
+        return pd.Series(b["block"].to_numpy(np.int64), index=pd.to_datetime(b["ts"])).sort_index()
+
+    def _approx_block(self, blk: pd.Series, t: pd.Timestamp) -> int:
+        """Block at time t, linearly interpolated between exact month anchors (for sampling windows)."""
+        x = blk.index.as_unit("ns").asi8.astype(np.float64)    # pandas 3 may store datetime64[us]
+        return int(np.interp(float(pd.Timestamp(t).as_unit("ns").value), x, blk.to_numpy(np.float64)))
+
     # ---- activity ------------------------------------------------------------------------------
     def activity(self) -> None:
-        ch, step = CHAINS[self.chain], CHUNK_BLOCKS[self.chain]
-        height = asyncio.run(self.dex.height())
-        d = self.root / "activity"
-        starts = list(range(ch.factory_block, height, step))
-        log(f"[activity] {len(starts)} chunks of {step} blocks up to {height}")
-        for i, lo in enumerate(starts):
-            hi = min(lo + step, height)
-            stem = d / f"blk_{lo:012d}_{lo + step:012d}"
-            act_f, day_f = stem.with_name(stem.name + "_act.parquet"), stem.with_name(stem.name + "_days.parquet")
-            if act_f.is_file() and day_f.is_file() and hi == lo + step:
-                continue  # the open-ended last chunk is always re-scanned
-            t = time.time()
-            act, days = asyncio.run(self.dex.activity(lo, hi))
-            atomic_write_parquet(days, day_f)
-            atomic_write_parquet(act, act_f)  # written last: its presence marks the chunk complete
-            log(f"[activity] chunk {i + 1}/{len(starts)} blocks {lo}-{hi}: {len(act)} pool-days, "
-                f"{int(act['n_swaps'].sum())} swaps, {time.time() - t:.1f}s")
-        self._merge_activity()
-
-    def _merge_activity(self) -> None:
-        d = self.root / "activity"
-        act = pd.concat([pd.read_parquet(f) for f in sorted(d.glob("blk_*_act.parquet"))], ignore_index=True)
-        act = act.groupby(["pool", "day"], as_index=False)["n_swaps"].sum()
-        days = pd.concat([pd.read_parquet(f) for f in sorted(d.glob("blk_*_days.parquet"))], ignore_index=True)
-        days = days.groupby("day", as_index=False)["first_block"].min().sort_values("day")
-        atomic_write_parquet(act, self.root / "activity_daily.parquet")
-        atomic_write_parquet(days, self.root / "day_blocks.parquet")
-        log(f"[activity] merged: {len(act)} pool-days, {act['pool'].nunique()} pools, "
-            f"days {days['day'].min().date()}..{days['day'].max().date()}")
+        blk = self._blocks()
+        for m in self.months[::-1]:
+            out = self.root / "activity" / f"{m:%Y-%m}.parquet"
+            if out.is_file():
+                continue
+            t, parts = time.time(), []
+            for d in SAMPLE_DAYS:
+                lo = self._approx_block(blk, m - pd.Timedelta(days=d))
+                hi = self._approx_block(blk, m - pd.Timedelta(days=d - 1))
+                act, _ = asyncio.run(self.dex.activity(lo, hi))
+                parts.append(act)
+            act = pd.concat(parts).groupby("pool", as_index=False)["n_swaps"].sum()
+            atomic_write_parquet(act.assign(month=m, sample_days=len(SAMPLE_DAYS)), out)
+            log(f"[activity] {m:%Y-%m}: {len(act)} pools, {int(act['n_swaps'].sum())} sampled swaps, "
+                f"{time.time() - t:.0f}s")
 
     # ---- candidates ----------------------------------------------------------------------------
     def candidates(self) -> None:
         pools = orient(pd.read_parquet(self.root / "pools.parquet"), self.chain)
-        act = pd.read_parquet(self.root / "activity_daily.parquet")
-        act = act.merge(pools[["pool", "base", "quote_kind"]], on="pool")
-        first_day = act.groupby("pool")["day"].min()
-        months = pd.date_range(act["day"].min().normalize().replace(day=1) + pd.DateOffset(months=1),
-                               pd.Timestamp.now().normalize().replace(day=1), freq="MS")
+        blk = self._blocks()
+        nonstable_quotes = {a for a, t in CHAINS[self.chain].quotes.items() if not t.stable}
         rows: List[pd.DataFrame] = []
-        for m in months:
-            win = act[(act["day"] >= m - pd.Timedelta(days=TRAIL_DAYS)) & (act["day"] < m)]
-            seasoned = first_day[first_day <= m - pd.Timedelta(days=SEASON_DAYS)].index
-            win = win[win["pool"].isin(seasoned)]
-            per_pool = win.groupby(["pool", "base", "quote_kind"], as_index=False)["n_swaps"].sum()
-            per_pool = per_pool.sort_values("n_swaps", ascending=False)
-            top_pools = per_pool.groupby("base").head(POOLS_PER_TOKEN)
+        for m in self.months:
+            f = self.root / "activity" / f"{m:%Y-%m}.parquet"
+            if not f.is_file():
+                continue
+            act = pd.read_parquet(f).merge(pools[["pool", "base", "quote_kind", "block"]], on="pool")
+            season_block = self._approx_block(blk, m - pd.Timedelta(days=SEASON_DAYS))
+            act = act[act["block"] <= season_block].sort_values("n_swaps", ascending=False)
+            top_pools = act.groupby("base").head(POOLS_PER_TOKEN)
             tok = top_pools.groupby("base")["n_swaps"].sum().sort_values(ascending=False)
             keep_tok = set(tok.index[:N_TOKENS])
             # USD reference pools for ETH and BTC are always kept, ranked the same point-in-time way
-            refs = per_pool[per_pool["quote_kind"] == "usd"]
-            refs = refs[refs["base"].isin({a for a, t in CHAINS[self.chain].quotes.items() if not t.stable})]
-            sel = pd.concat([top_pools[top_pools["base"].isin(keep_tok)], refs.groupby("base").head(2)])
-            sel = sel.drop_duplicates("pool").assign(month=m)
-            sel["token_rank"] = sel["base"].map({b: i + 1 for i, b in enumerate(tok.index)})
-            rows.append(sel)
+            refs = act[(act["quote_kind"] == "usd") & act["base"].isin(nonstable_quotes)].groupby("base").head(2)
+            sel = pd.concat([top_pools[top_pools["base"].isin(keep_tok)], refs]).drop_duplicates("pool")
+            sel = sel.assign(month=m, token_rank=sel["base"].map({b: i + 1 for i, b in enumerate(tok.index)}))
+            rows.append(sel.drop(columns=["block"]))
         cand = pd.concat(rows, ignore_index=True)
         atomic_write_parquet(cand, self.root / "candidates_monthly.parquet")
         log(f"[candidates] {cand['pool'].nunique()} pools / {cand['base'].nunique()} tokens over "
@@ -136,14 +158,11 @@ class CryptoDownloader:
     # ---- swaps ---------------------------------------------------------------------------------
     def swaps(self) -> None:
         cand = pd.read_parquet(self.root / "candidates_monthly.parquet")
-        days = pd.read_parquet(self.root / "day_blocks.parquet").set_index("day")["first_block"]
+        blk = self._blocks()
         height = asyncio.run(self.dex.height())
-        month_first_block = days.groupby(days.index.to_period("M")).min()
-        months = sorted(set(month_first_block.index.to_timestamp()))
         member: Dict[pd.Timestamp, set] = {m: set(g["pool"]) for m, g in cand.groupby("month")}
         cur = pd.Timestamp.now().normalize().replace(day=1)
-        log(f"[swaps] {len(months)} months")
-        for i, m in enumerate(months[::-1]):  # newest first: recent data is the most valuable
+        for i, m in enumerate(self.months[::-1]):  # newest first: recent data is the most valuable
             ahead = [member.get(m + pd.DateOffset(months=k), set()) for k in range(LOOKAHEAD_MONTHS + 1)]
             pool_set = sorted(set().union(*ahead))
             if not pool_set:
@@ -151,21 +170,19 @@ class CryptoDownloader:
             out = self.root / "swaps" / f"{m:%Y-%m}.parquet"
             if out.is_file() and not (m == cur and time.time() - out.stat().st_mtime > 6 * 3600):
                 continue
-            lo = int(month_first_block[m.to_period("M")])
             nxt = m + pd.DateOffset(months=1)
-            hi = int(month_first_block[nxt.to_period("M")]) if nxt.to_period("M") in month_first_block.index \
-                else height
+            lo, hi = int(blk[m]), (int(blk[nxt]) if nxt in blk.index else height)
             t = time.time()
             df = asyncio.run(self.dex.swaps(pool_set, lo, hi))
             atomic_write_parquet(df, out)
             log(f"[swaps] {m:%Y-%m}: {len(pool_set)} pools, {len(df)} swaps, blocks {lo}-{hi}, "
-                f"{time.time() - t:.0f}s ({i + 1}/{len(months)})")
+                f"{time.time() - t:.0f}s ({i + 1}/{len(self.months)})")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Download Uniswap v3 swaps via HyperSync (resumable)")
     ap.add_argument("--chain", required=True, choices=sorted(CHAINS))
-    ap.add_argument("--phases", default="pools,activity,candidates,swaps")
+    ap.add_argument("--phases", default="pools,anchors,activity,candidates,swaps")
     ap.add_argument("--root", type=Path, default=data_root())
     args = ap.parse_args()
     dl = CryptoDownloader(args.root, args.chain)

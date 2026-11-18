@@ -93,6 +93,11 @@ def _addr_from_word(col) -> List[str]:
     return [("0x" + h[-40:]).lower() if h is not None else None for h in col]
 
 
+def _empty(d) -> bool:
+    """A streamed response may carry no log table at all (e.g. a range with no matches)."""
+    return d is None or d.logs is None or d.logs.num_rows == 0
+
+
 class Dex:
     def __init__(self, chain: str) -> None:
         self.chain = CHAINS[chain]
@@ -101,6 +106,42 @@ class Dex:
 
     async def height(self) -> int:
         return await self.client.get_height()
+
+    async def block_time(self, block: int) -> int:
+        """Timestamp (UTC s) of one block."""
+        q = Query(from_block=block, to_block=block + 1, include_all_blocks=True,
+                  field_selection=FieldSelection(block=[BlockField.NUMBER, BlockField.TIMESTAMP]))
+        for attempt in range(8):
+            try:
+                r = await self.client.get(q)
+                return int(r.data.blocks[0].timestamp, 16)
+            except Exception:
+                if attempt == 7:
+                    raise
+                await asyncio.sleep(2 ** attempt)
+        raise AssertionError("unreachable")
+
+    async def block_at(self, ts: int, lo: int, hi: int) -> int:
+        """First block in (lo, hi] with timestamp >= ts (interpolation search, bisection fallback)."""
+        t_lo, t_hi = await self.block_time(lo), await self.block_time(hi)
+        if ts <= t_lo:
+            return lo
+        if ts > t_hi:
+            return hi
+        step = 0
+        while hi - lo > 1:
+            if step % 2 == 0 and t_hi > t_lo:          # interpolate, then bisect, alternately
+                g = lo + int((ts - t_lo) / (t_hi - t_lo) * (hi - lo))
+            else:
+                g = (lo + hi) // 2
+            g = min(max(g, lo + 1), hi - 1)
+            t_g = await self.block_time(g)
+            if t_g >= ts:
+                hi, t_hi = g, t_g
+            else:
+                lo, t_lo = g, t_g
+            step += 1
+        return hi
 
     async def _scan(self, query: Query, on_batch: Callable[[object], None], to_block: int,
                     signature: Optional[str] = None, progress: Optional[Callable[[int], None]] = None) -> None:
@@ -130,7 +171,7 @@ class Dex:
         parts: List[pd.DataFrame] = []
 
         def on_batch(d):
-            if d.logs.num_rows == 0:
+            if _empty(d):
                 return
             logs = d.logs.to_pydict()
             parts.append(pd.DataFrame({
@@ -155,7 +196,7 @@ class Dex:
         day_blocks: List[pd.DataFrame] = []
 
         def on_batch(d):
-            if d.logs.num_rows == 0:
+            if _empty(d):
                 return
             logs = d.logs.select(["address", "block_number"]).to_pandas()
             blocks = d.blocks.select(["number", "timestamp"]).to_pandas()
@@ -181,7 +222,7 @@ class Dex:
         parts: List[pd.DataFrame] = []
 
         def on_batch(d):
-            if d.logs.num_rows == 0:
+            if _empty(d):
                 return
             logs = d.logs.select(["block_number", "log_index", "address", "transaction_hash"]).to_pandas()
             dec = d.decoded_logs.to_pydict()

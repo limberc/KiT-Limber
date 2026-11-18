@@ -21,8 +21,6 @@ import pandas as pd
 
 from kit2.env import load_env, secret
 
-URL = "https://www.alphavantage.co/query"
-
 
 class NotCovered(Exception):
     """Alpha Vantage has no data for this request (e.g. intraday for a delisted symbol). Permanent."""
@@ -54,7 +52,8 @@ class AlphaVantage:
         self.last_throttle_msg = ""
         self.n_net_errors = 0
         self.last_net_error = ""
-        self.busy_s = 0.0                # summed request wall time, for mean latency
+        self.busy_s = 0.0  # summed request wall time, for mean latency
+        self.URL = "https://www.alphavantage.co/query"
 
     def _get(self, params: Dict[str, str], retries: int = 6) -> str:
         q = urllib.parse.urlencode({**params, "apikey": self.key})
@@ -64,7 +63,7 @@ class AlphaVantage:
             self.n_requests += 1
             t0 = time.monotonic()
             try:
-                with urllib.request.urlopen(f"{URL}?{q}", timeout=60) as r:
+                with urllib.request.urlopen(f"{self.URL}?{q}", timeout=60) as r:
                     body = r.read().decode("utf-8")
             except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
                 err = repr(e)
@@ -74,7 +73,7 @@ class AlphaVantage:
             else:
                 self.busy_s += time.monotonic() - t0
                 if not body.lstrip().startswith("{"):
-                    return body                              # CSV payload
+                    return body  # CSV payload
                 msg = json.loads(body)
                 if "Error Message" in msg:
                     raise NotCovered(msg["Error Message"][:200])
@@ -83,7 +82,7 @@ class AlphaVantage:
                     self.n_throttled += 1
                     self.last_throttle_msg = err
                 else:
-                    return body                              # JSON payload (splits, dividends, ...)
+                    return body  # JSON payload (splits, dividends, ...)
             if attempt == retries - 1:
                 raise RuntimeError(f"Alpha Vantage request failed after {retries} tries: {err}")
             time.sleep(delay)
@@ -131,6 +130,6 @@ class AlphaVantage:
         cols = ["ex_dividend_date", "declaration_date", "record_date", "payment_date", "amount"]
         df = pd.DataFrame(data, columns=cols)
         for c in cols[:-1]:
-            df[c] = pd.to_datetime(df[c], errors="coerce")       # 'None' -> NaT
+            df[c] = pd.to_datetime(df[c], errors="coerce")  # 'None' -> NaT
         df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
         return df.sort_values("ex_dividend_date").reset_index(drop=True)

@@ -144,3 +144,92 @@ def test_universe_uses_only_data_before_month():
         got = monthly_universe(trunc, windows, [m], top_n=10)
         want = full[full["month"] == m].reset_index(drop=True)
         pd.testing.assert_frame_equal(want, got.reset_index(drop=True), check_exact=True)
+
+
+# ---- crypto ------------------------------------------------------------------------------------------
+from kit2.data.bars_crypto import build_token_bars, reference_series  # noqa: E402
+
+CRYPTO_MONTHS = list(pd.period_range("2025-01", "2025-02", freq="M"))
+
+
+def synth_swaps(seed: int = 0):
+    """Token X with a USDC pool (X=token0) and a WETH pool (WETH=token0), plus a USDC/WETH reference pool.
+    Blocks every 12 s, a few swaps per block sharing the block timestamp."""
+    rng = np.random.default_rng(seed)
+    t0 = int(pd.Timestamp("2025-01-01").timestamp())
+    n_blocks = 59 * 24 * 300                                   # ~59 days of 12 s blocks
+    blocks = np.sort(rng.choice(n_blocks, size=n_blocks // 6, replace=False))
+    rows, eth_lp, x_lp = [], np.log(3000.0), np.log(0.5)
+    for b in blocks:
+        ts = t0 + 12 * int(b)
+        eth_lp += rng.normal(0, 2e-4)
+        x_lp += rng.normal(0, 6e-4)
+        for k in range(int(rng.integers(1, 4))):
+            pool = rng.choice(["usdc_x", "weth_x", "ref"], p=[0.4, 0.3, 0.3])
+            amt = float(rng.lognormal(10, 1)) * rng.choice([-1, 1])
+            jitter = rng.normal(0, 1e-4)                         # intra-block noise (sandwich-like)
+            if pool == "usdc_x":    # token0 = X (18 dec), token1 = USDC (6 dec): ln(USDC raw / X raw)
+                lp = x_lp + jitter + np.log(1e6) - np.log(1e18)
+                a0, a1 = -amt * 1e12, amt
+            elif pool == "weth_x":  # token0 = WETH (18), token1 = X (18): ln(X raw / WETH raw)
+                lp = eth_lp - x_lp + jitter
+                a0, a1 = amt * 1e12, -amt * 1e12
+            else:                   # token0 = USDC (6), token1 = WETH (18): ln(WETH raw / USDC raw)
+                lp = -(eth_lp + jitter) + np.log(1e18) - np.log(1e6)
+                a0, a1 = amt, -amt * 1e12
+            rows.append((int(b), k, ts, pool, a0, a1, lp, 1e18, 0, f"0x{rng.integers(0, 50):040x}", 1.5))
+    sw = pd.DataFrame(rows, columns=["block", "log_index", "ts", "pool", "amount0", "amount1", "log_price",
+                                     "liquidity", "tick", "tx_from", "base_fee_gwei"])
+    pools = pd.DataFrame({"pool": ["usdc_x", "weth_x"], "quote_is_token0": [False, True],
+                          "quote_kind": ["usd", "eth"], "quote_dec": [6, 18]})
+    return sw, pools
+
+
+@pytest.fixture(scope="module")
+def crypto():
+    sw, pools = synth_swaps()
+    return sw[sw["pool"] != "ref"], sw[sw["pool"] == "ref"], pools
+
+
+def _crypto_bars(tok, ref, pools, scale):
+    refs = {"eth": reference_series(ref, quote_is_token0=True, base_dec=18, quote_dec=6)}
+    primary = {CRYPTO_MONTHS[0]: "usdc_x", CRYPTO_MONTHS[1]: "weth_x"}      # switches quote type mid-sample
+    return build_token_bars(tok, pools, primary, scale, CRYPTO_MONTHS, refs)
+
+
+@pytest.mark.parametrize("scale", ["1m", "15m", "1h", "1d"])
+def test_crypto_prefix_invariance(crypto, scale):
+    tok, ref, pools = crypto
+    full = _crypto_bars(tok, ref, pools, scale)
+    assert full["close"].notna().all() and (full["close"] > 0).all()
+    rng = np.random.default_rng(11)
+    for t in rng.integers(tok["ts"].min(), tok["ts"].max(), size=8):
+        tt = pd.Timestamp(int(t), unit="s")
+        trunc = _crypto_bars(tok[tok["ts"] <= t], ref[ref["ts"] <= t], pools, scale)
+        pd.testing.assert_frame_equal(_upto(full, tt), _upto(trunc, tt), check_exact=True)
+
+
+def test_crypto_future_perturbation(crypto):
+    tok, ref, pools = crypto
+    full = _crypto_bars(tok, ref, pools, "5m")
+    rng = np.random.default_rng(12)
+    for t in rng.integers(tok["ts"].min(), tok["ts"].max(), size=5):
+        f_tok, f_ref = tok.copy(), ref.copy()
+        for f in (f_tok, f_ref):
+            fut = (f["ts"] > t).to_numpy()
+            f.loc[fut, "log_price"] += rng.normal(0, 0.1, fut.sum())
+            f.loc[fut, ["amount0", "amount1"]] *= rng.lognormal(0, 1, (fut.sum(), 1))
+        pert = _crypto_bars(f_tok, f_ref, pools, "5m")
+        tt = pd.Timestamp(int(t), unit="s")
+        pd.testing.assert_frame_equal(_upto(full, tt), _upto(pert, tt), check_exact=True)
+
+
+def test_crypto_usd_price_is_consistent_across_quote_pools(crypto):
+    """Switching the primary pool from USDC- to WETH-quoted must not create a level jump (decimals/ref right)."""
+    tok, ref, pools = crypto
+    bars = _crypto_bars(tok, ref, pools, "1h")
+    switch = bars["ts"] >= pd.Timestamp("2025-02-01")
+    i = int(np.argmax(switch.to_numpy()))
+    gap = np.log(bars["open"].iloc[i] / bars["close"].iloc[i - 1])
+    assert abs(gap) < 0.01, gap
+    assert 0.3 < bars["close"].iloc[i] / 1.0 < 1.0                # X starts near 0.5 USD

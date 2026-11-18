@@ -71,3 +71,4 @@ makes them faster.
 
 Thirty context ETFs are always included: SPY, QQQ, IWM, DIA, the sector SPDRs, SMH, KRE, TLT/IEF/SHY, HYG/LQD, GLD/SLV/USO/UNG, UUP, EEM/EFA and VIXY.
 
+The HyperSync scans are running slow: Ethereum chunks take about 5 minutes, Arbitrum about 11, and Base has sat in its pool-registry phase for 30 minutes. I'm checking whether HyperSync is rate-limiting the token and whether the Base process is still alive.

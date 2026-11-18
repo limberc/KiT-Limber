@@ -66,6 +66,7 @@ class USDownloader:
         self.top_n = top_n
         self.end = pd.Timestamp(end)
         self.av = AlphaVantage()
+        self.universe_path = self.root / "universe" / f"monthly_top{self.top_n}.parquet"
 
     # ---- listings ------------------------------------------------------------------------------
     def listings(self) -> None:
@@ -99,10 +100,6 @@ class USDownloader:
         syms = sorted(set(self._candidates()["symbol"]) | set(CONTEXT_ETFS))
         run_jobs("daily", syms, self._daily_one, self.workers, self.av)
 
-    # ---- universe ------------------------------------------------------------------------------
-    def universe_path(self) -> Path:
-        return self.root / "universe" / f"monthly_top{self.top_n}.parquet"
-
     def universe(self) -> None:
         cands = self._candidates()
         win = listing_windows(cands)
@@ -113,12 +110,15 @@ class USDownloader:
                 daily[sym] = pd.read_parquet(p, columns=["date", "close", "volume"])
         months = pd.date_range(START, self.end, freq="MS")
         uni = monthly_universe(daily, win, months, top_n=self.top_n)
-        atomic_write_parquet(uni, self.universe_path())
+        atomic_write_parquet(uni, self.universe_path)
         log(f"[universe] {uni['symbol'].nunique()} symbols over {uni['month'].nunique()} months "
             f"(daily coverage {len(daily)}/{len(win)} candidates)")
 
+    def _load_uni(self):
+        return pd.read_parquet(self.universe_path)
+
     def _union_symbols(self) -> List[str]:
-        uni = pd.read_parquet(self.universe_path())
+        uni = self._load_uni()
         return sorted(set(uni["symbol"]) | set(CONTEXT_ETFS))
 
     # ---- corporate actions ---------------------------------------------------------------------
@@ -142,7 +142,7 @@ class USDownloader:
     # ---- intraday ------------------------------------------------------------------------------
     def intraday_plan(self) -> pd.DataFrame:
         """(symbol, month, priority) ticker-months to fetch: membership months + warm-up, newest first."""
-        uni = pd.read_parquet(self.universe_path())
+        uni = self._load_uni()
         all_months = pd.date_range(START, self.end, freq="MS")
         rows = []
         for sym, g in uni.groupby("symbol"):
