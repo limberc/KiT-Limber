@@ -1,9 +1,10 @@
 """KiT-2 data pipeline: raw downloads, point-in-time bars, leakage tests."""
 from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:                     # for IDEs and type checkers; real imports are lazy (__getattr__)
+if TYPE_CHECKING:  # for IDEs and type checkers; real imports are lazy (__getattr__)
     from .crypto.download import CryptoDownloader
     from .us.download import USDownloader
+    from .store import MarketStore
 
 __all__ = ["CryptoDownloader", "USDownloader"]
 
@@ -17,4 +18,6 @@ def __getattr__(name: str):
     if name == "USDownloader":
         from .us.download import USDownloader
         return USDownloader
+    if name == "MarketStore":
+        return MarketStore
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

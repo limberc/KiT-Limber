@@ -19,7 +19,8 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
-from kit2.data.store import CHANNELS, TRAIN_END, VAL_END, MarketStore
+from kit2.data import MarketStore
+from kit2.data.store import CHANNELS, TRAIN_END, VAL_END
 from kit2.train.batch import ScaleWindow, assemble, audit
 from kit2.train.buckets import MARKET_ID, SCALE_ID, Bucket
 
@@ -44,7 +45,8 @@ class GroupSampler:
     def _anchor_idx(self, market: str) -> np.ndarray:
         """Market anchors put first in every group (store column `anchor`; US fallback: SPY, QQQ)."""
         inst = self.stores[market].instruments
-        mask = inst["anchor"].to_numpy(bool) if "anchor" in inst else inst["key"].isin(ALWAYS.get(market, ())).to_numpy()
+        mask = inst["anchor"].to_numpy(bool) if "anchor" in inst else inst["key"].isin(
+            ALWAYS.get(market, ())).to_numpy()
         return inst.loc[mask, "idx"].to_numpy(np.int64)
 
     def _valid_ends(self, bk: Bucket) -> np.ndarray:
@@ -100,7 +102,6 @@ class GroupSampler:
         covered at every scale are used) and anchor patches [B, A]."""
         bk, G, P = self.buckets[k], self.G, 8
         st = self.stores[bk.market]
-        tgt = st.scales[bk.scale]
         B, Ls = len(ends), [n * P for n in bk.n_patches]
         xs = [np.zeros((B, G, Lb, len(CHANNELS)), dtype=np.float16) for Lb in Ls]
         starts = [np.zeros(B, dtype=np.int64) for _ in Ls]
