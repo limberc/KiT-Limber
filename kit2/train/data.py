@@ -82,6 +82,19 @@ class GroupSampler:
         p = p[ok]
         return np.sort(rng.choice(p, size=self.A, replace=len(p) < self.A))
 
+    def window_offsets(self, k: int, e: int, cand: np.ndarray):
+        """Window start per scale for window end e, and store row offsets [n_scales, len(cand)] (-1: the
+        instrument does not cover that window contiguously)."""
+        bk, P = self.buckets[k], 8
+        st = self.stores[bk.market]
+        Ls = [n * P for n in bk.n_patches]
+        t_end = st.scales[bk.scale].grid[e]
+        gs = [e - Ls[0] + 1] + [int(np.searchsorted(st.scales[s].grid, t_end, side="right")) - Lb
+                                for s, Lb in zip(bk.scales[1:], Ls[1:])]
+        cand = np.asarray(cand, dtype=np.int64)
+        offs = np.stack([st.scales[s].locate(cand, np.full(len(cand), g), Lb) for s, g, Lb in zip(bk.scales, gs, Ls)])
+        return gs, offs
+
     def build(self, k: int, ends: np.ndarray, cands: List[np.ndarray], anchors: np.ndarray) -> Dict[str, np.ndarray]:
         """Batch for window ends [B] (target grid index), candidate instruments per sample (in order; the first G
         covered at every scale are used) and anchor patches [B, A]."""
@@ -94,15 +107,11 @@ class GroupSampler:
         inst = np.zeros((B, G), dtype=np.int64)
         valid = np.zeros((B, G), dtype=bool)
         for i, (e, cand) in enumerate(zip(ends, cands)):
-            gs = [int(e) - Ls[0] + 1]
-            for s, Lb in zip(bk.scales[1:], Ls[1:]):
-                gs.append(int(np.searchsorted(st.scales[s].grid, tgt.grid[e], side="right")) - Lb)
+            gs, offs = self.window_offsets(k, int(e), cand)
             for j, g in enumerate(gs):
                 starts[j][i] = g
             if len(cand) == 0:
                 continue
-            offs = np.stack([st.scales[s].locate(cand, np.full(len(cand), g), Lb)
-                             for s, g, Lb in zip(bk.scales, gs, Ls)])
             take = np.flatnonzero(np.all(offs >= 0, axis=0))[:G]
             for slot, c in enumerate(take):
                 for j, s in enumerate(bk.scales):
@@ -197,17 +206,22 @@ class StoreData(L.LightningDataModule):
 
     def on_after_batch_transfer(self, batch: Dict[str, torch.Tensor], dataloader_idx: int) -> Dict[str, torch.Tensor]:
         bk = self.buckets[int(batch["bucket"])]
-        dev = batch["anchors"].device
-        wins = []
-        for j, s in enumerate(bk.scales):
-            grid, cal = self._gpu_tables(bk.market, s, dev)
-            wins.append(ScaleWindow(batch[f"x{j}"], batch[f"start{j}"], grid, cal, SCALE_ID[s]))
-        B = batch["anchors"].shape[0]
-        meta = {k: batch[k] for k in ("inst", "market", "chain", "valid")}
-        meta["target_scale"] = torch.full((B,), SCALE_ID[bk.scale], dtype=torch.long, device=dev)
-        cfg = self.trainer.lightning_module.cfg if self.trainer is not None else None
-        b = assemble(wins, batch["anchors"], bk.horizon, meta, cfg)
-        split_end = TRAIN_END.value if (self.trainer is not None and self.trainer.training) else None
-        audit(b, split_end_ns=split_end)
-        b["bucket"] = batch["bucket"]
+        cfg = self.trainer.lightning_module.cfg
+        b = to_model_batch(batch, bk, lambda m, s, d: self._gpu_tables(m, s, d), cfg)
+        audit(b, split_end_ns=TRAIN_END.value if self.trainer.training else None)
         return b
+
+
+def to_model_batch(batch: Dict[str, torch.Tensor], bk: Bucket, tables, cfg) -> Dict[str, torch.Tensor]:
+    """Sampler output (on the GPU) -> model batch. tables(market, scale, device) -> (grid, cal) tensors."""
+    dev = batch["anchors"].device
+    wins = []
+    for j, s in enumerate(bk.scales):
+        grid, cal = tables(bk.market, s, dev)
+        wins.append(ScaleWindow(batch[f"x{j}"], batch[f"start{j}"], grid, cal, SCALE_ID[s]))
+    B = batch["anchors"].shape[0]
+    meta = {k: batch[k] for k in ("inst", "market", "chain", "valid")}
+    meta["target_scale"] = torch.full((B,), SCALE_ID[bk.scale], dtype=torch.long, device=dev)
+    b = assemble(wins, batch["anchors"], bk.horizon, meta, cfg)
+    b["bucket"] = batch["bucket"]
+    return b
