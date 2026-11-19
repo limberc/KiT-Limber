@@ -23,17 +23,17 @@ from typing import Dict, List
 import numpy as np
 import pandas as pd
 
-from kit2.data.crypto.bars import AUX_COLS, build_token_bars, primary_pools, reference_series
-from kit2.data.crypto.download import LOOKAHEAD_MONTHS, orient
-from kit2.data.crypto.hypersync_dex import CHAINS
 from kit2.data.features import candle_features
 from kit2.data.store import calendar_features, finalize_store
 from kit2.env import data_root
+from .bars import AUX_COLS, build_token_bars, primary_pools, reference_series
+from .download import LOOKAHEAD_MONTHS, orient
+from .hypersync_dex import CHAINS
 
 SCALES = ("1m", "5m", "15m", "30m", "1h", "2h", "1d")
 STEP_S = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "2h": 7200, "1d": 86400}
 CHAIN_ID = {"eth": 1, "base": 2, "arbitrum": 3}
-VOCAB_OFFSET = 4000                 # crypto instrument ids follow the US ones in the shared embedding table
+VOCAB_OFFSET = 4000  # crypto instrument ids follow the US ones in the shared embedding table
 HALF_LIFE_DAYS = 5.0
 KEEP = ["block", "log_index", "ts", "pool", "amount0", "amount1", "log_price", "liquidity", "tx_from", "base_fee_gwei"]
 
@@ -45,12 +45,12 @@ def log(msg: str) -> None:
 def crypto_grid(scale: str, start: pd.Timestamp, end: pd.Timestamp):
     """Regular UTC grid of bar close times (ns) and calendar features; a UTC day is the 'session'."""
     step = STEP_S[scale]
-    t0, t1 = start.value // 10**9, end.value // 10**9
+    t0, t1 = start.value // 10 ** 9, end.value // 10 ** 9
     close = np.arange(t0 + step, t1 + 1, step, dtype=np.int64)
     per_day = 86400 // step
     pos = ((close - 1) % 86400) // step
     minute = ((close % 86400) // 60).astype(float)
-    ts = close * 10**9
+    ts = close * 10 ** 9
     return ts, calendar_features(ts, minute, pos.astype(float), np.full(len(ts), float(per_day)))
 
 
@@ -213,7 +213,7 @@ def main() -> None:
     store.mkdir(parents=True, exist_ok=True)
     jobs = [(raw_root / r.chain_name, split_dir, r.chain_name, r.base, r.idx, store_tmp, scales)
             for r in inst.itertuples()]
-    jobs.sort(key=lambda j: j[2])                       # a worker's chain tables are cached per chain
+    jobs.sort(key=lambda j: j[2])  # a worker's chain tables are cached per chain
     t0, counts = time.time(), {s: 0 for s in scales}
     with ProcessPoolExecutor(args.workers) as ex:
         for i, res in enumerate(ex.map(build_token, jobs), 1):

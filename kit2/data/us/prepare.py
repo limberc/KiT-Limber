@@ -14,21 +14,21 @@ import shutil
 import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
 
 from kit2.data.features import candle_features
 from kit2.data.store import calendar_features, finalize_store
-from kit2.data.us.bars import ET, INTRADAY_MIN, build_daily, build_intraday, create_cal
-from kit2.data.us.universe import CONTEXT_ETFS
 from kit2.env import data_root
+from .bars import ET, INTRADAY_MIN, build_daily, build_intraday, create_cal
+from .universe import CONTEXT_ETFS
 
 SCALES = ("1m", "5m", "15m", "30m", "1h", "2h", "1d")
 AUX = ("aux_pre_ret", "aux_post_ret", "aux_pre_ldv", "aux_post_ldv")
 HALF_LIFE_DAYS = 5.0
-DAILY_LOOKBACK_DAYS = 420          # 1d history kept before --start (32 coarse patches x 8 bars + EMA warm-up)
+DAILY_LOOKBACK_DAYS = 420  # 1d history kept before --start (32 coarse patches x 8 bars + EMA warm-up)
 
 
 def log(msg: str) -> None:
@@ -38,7 +38,7 @@ def log(msg: str) -> None:
 def us_grid(scale: str, start: str, end: str):
     """Bar close times on the XNYS grid (naive UTC ns) + calendar features."""
     cal = create_cal()
-    cal = cal[(cal["session"] >= start) & (cal["close"] <= pd.Timestamp(end))]   # sessions closed by `end`
+    cal = cal[(cal["session"] >= start) & (cal["close"] <= pd.Timestamp(end))]  # sessions closed by `end`
     if scale == "1d":
         ts = cal["close"].to_numpy("datetime64[ns]")
         pos, n = np.zeros(len(ts)), np.ones(len(ts))
@@ -161,7 +161,8 @@ def main() -> None:
 
     lookback = {s: DAILY_LOOKBACK_DAYS if s == "1d" else 0 for s in scales}
     finalize_store(store, tmp, scales, lambda s: us_grid(s, str((pd.Timestamp(args.start)
-                   - pd.Timedelta(days=lookback[s])).date()), args.end), args.stats_sample, log)
+                                                                 - pd.Timedelta(days=lookback[s])).date()), args.end),
+                   args.stats_sample, log)
     log("done")
 
 
