@@ -25,6 +25,7 @@ from .features import FEATURES
 CHANNELS = (*FEATURES, "has_obs", "aux0", "aux1", "aux2", "aux3")
 N_CANDLE = len(FEATURES)
 CAL_DIM = 12
+CAL_FIRST = 10                     # calendar column: first bar of the session (known in advance)
 SOFT_CLIP = 6.0
 TRAIN_END = pd.Timestamp("2026-06-30 23:59:59")
 VAL_END = pd.Timestamp("2026-08-31 23:59:59")
@@ -46,28 +47,45 @@ def calendar_features(ts: np.ndarray, local_minute: np.ndarray, sess_pos: np.nda
 
 
 # ---- normalisation -------------------------------------------------------------------------------------
-def fit_stats(samples: np.ndarray) -> Dict[str, List[float]]:
-    """samples [n, CHANNELS] raw values from training-period bars. Candle features keep KiT's convention
-    (no centering, scale = 1.4826 MAD); aux channels are centered on the median; has_obs is left as is."""
+def _robust_scale(x: np.ndarray) -> float:
+    x = x[np.isfinite(x)]
+    if x.size == 0:
+        return 1.0
+    s = 1.4826 * float(np.median(np.abs(x - np.median(x))))
+    return s if s > 1e-12 else max(float(np.std(x)), 1e-6)
+
+
+def fit_stats(samples: np.ndarray, first: np.ndarray) -> Dict[str, List[float]]:
+    """samples [n, CHANNELS] raw values from training-period bars; first [n] = first bar of its session.
+    Candle features keep KiT's convention (no centering, scale = 1.4826 MAD); aux channels are centered on
+    the median; has_obs is left as is. The open gap of a session's first bar (overnight / weekend) gets its own
+    scale: intraday gaps are tiny, and one shared scale would clip every overnight gap."""
     center, scale = [], []
     for j, name in enumerate(CHANNELS):
         x = samples[:, j]
-        x = x[np.isfinite(x)]
-        if name == "has_obs" or x.size == 0:
+        if name == "has_obs":
             center.append(0.0), scale.append(1.0)
             continue
-        c = 0.0 if j < N_CANDLE else float(np.median(x))
-        s = 1.4826 * float(np.median(np.abs(x - np.median(x))))
-        if s < 1e-12:
-            s = max(float(np.std(x)), 1e-6)
-        center.append(c), scale.append(s)
-    return {"center": center, "scale": scale}
+        if name == "r_gap":
+            x = x[~first]
+        xf = x[np.isfinite(x)]
+        center.append(0.0 if j < N_CANDLE or xf.size == 0 else float(np.median(xf)))
+        scale.append(_robust_scale(x))
+    gap_first = samples[first, CHANNELS.index("r_gap")]
+    return {"center": center, "scale": scale,
+            "gap_first_scale": _robust_scale(gap_first) if gap_first.size > 100 else scale[0]}
 
 
-def normalise(raw: np.ndarray, stats: Dict[str, List[float]]) -> np.ndarray:
+def channel_scales(stats: Dict[str, List[float]], first: np.ndarray) -> np.ndarray:
+    """[n, CHANNELS] per-row scales (r_gap uses the first-bar scale on session-first bars)."""
+    s = np.broadcast_to(np.asarray(stats["scale"], dtype=np.float64), (len(first), len(CHANNELS))).copy()
+    s[first, CHANNELS.index("r_gap")] = stats["gap_first_scale"]
+    return s
+
+
+def normalise(raw: np.ndarray, stats: Dict[str, List[float]], first: np.ndarray) -> np.ndarray:
     """raw [n, CHANNELS] -> soft-clipped normalised float16; NaN (aux missing on that bar) -> 0."""
-    c, s = np.asarray(stats["center"]), np.asarray(stats["scale"])
-    y = (raw - c) / s
+    y = (raw - np.asarray(stats["center"])) / channel_scales(stats, first)
     y = SOFT_CLIP * np.tanh(y / SOFT_CLIP)
     y[:, CHANNELS.index("has_obs")] = raw[:, CHANNELS.index("has_obs")]
     return np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float16)
@@ -92,8 +110,9 @@ def write_scale(out_dir: Path, grid: np.ndarray, cal: np.ndarray, parts: Iterabl
     n_total = sum(len(p[1]) for p in parts)
     X = np.lib.format.open_memmap(out_dir / "X.npy.tmp", mode="w+", dtype=np.float16, shape=(n_total, len(CHANNELS)))
     runs, off = [], 0
+    first_of = cal[:, CAL_FIRST] > 0.5
     for idx, raw, gidx, seg in parts:
-        X[off: off + len(raw)] = normalise(raw, stats)
+        X[off: off + len(raw)] = normalise(raw, stats, first_of[gidx])
         for a, b, g0 in runs_from_segments(gidx, seg):
             runs.append((idx, g0, b - a, off + a))
         off += len(raw)
