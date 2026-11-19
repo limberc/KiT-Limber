@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 
 from kit2.data.features import candle_features
-from kit2.data.store import CAL_DIM, CHANNELS, TRAIN_END, calendar_features, fit_stats, write_scale
+from kit2.data.store import CAL_DIM, CAL_FIRST, CHANNELS, TRAIN_END, calendar_features, fit_stats, write_scale
 from kit2.data.us.bars import ET, INTRADAY_MIN, build_daily, build_intraday, create_cal
 from kit2.data.us.universe import CONTEXT_ETFS
 from kit2.env import data_root
@@ -39,7 +39,7 @@ def log(msg: str) -> None:
 def us_grid(scale: str, start: str, end: str):
     """Bar close times on the XNYS grid (naive UTC ns) + calendar features."""
     cal = create_cal()
-    cal = cal[(cal["session"] >= start) & (cal["session"] <= end)]
+    cal = cal[(cal["session"] >= start) & (cal["close"] <= pd.Timestamp(end))]   # sessions closed by `end`
     if scale == "1d":
         ts = cal["close"].to_numpy("datetime64[ns]")
         pos, n = np.zeros(len(ts)), np.ones(len(ts))
@@ -81,17 +81,22 @@ def build_symbol(job) -> Dict[str, Optional[tuple]]:
     files = [f for f in files if f.is_file()]
     cover = [pd.Period(f.stem, "M") for f in files]
     raw = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True) if files else None
+    # snapshot time: the newest month file was written then; no bars may be emitted after it
+    asof = (pd.Timestamp(max(f.stat().st_mtime for f in files), unit="s") if files else None)
     for scale in scales:
         if scale == "1d":
-            d = _read(raw_root / "daily" / f"{sym}.parquet")
+            f = raw_root / "daily" / f"{sym}.parquet"
+            d = _read(f)
             if d is None:
                 continue
             d = d[pd.to_datetime(d["date"]) >= pd.Timestamp(start) - pd.Timedelta(days=DAILY_LOOKBACK_DAYS)]
             bars = build_daily(d, splits, divs)
+            # a daily file fetched during a session ends with a partial day stamped at the close: drop it
+            bars = bars[bars["ts"] <= pd.Timestamp(f.stat().st_mtime, unit="s")].reset_index(drop=True)
         else:
             if raw is None:
                 continue
-            bars = build_intraday(raw, scale, cover, splits, divs)
+            bars = build_intraday(raw, scale, cover, splits, divs, asof=asof)
         if len(bars) < 2:
             continue
         np.savez(tmp / scale / f"{idx}.npz", raw=channels(bars, scale),
@@ -103,14 +108,16 @@ def build_symbol(job) -> Dict[str, Optional[tuple]]:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--start", default="2023-10")
-    ap.add_argument("--end", default=pd.Timestamp.now().strftime("%Y-%m-%d"))
+    ap.add_argument("--end", default=pd.Timestamp.now(tz="UTC").tz_localize(None).isoformat())
     ap.add_argument("--scales", default=",".join(SCALES))
     ap.add_argument("--workers", type=int, default=32)
     ap.add_argument("--root", type=Path, default=data_root())
     ap.add_argument("--stats-sample", type=int, default=300_000, help="training rows per scale used for stats")
+    ap.add_argument("--symbols", default="", help="comma list: build only these (smoke tests), into --out-name")
+    ap.add_argument("--out-name", default="us", help="store directory name under <root>/store/")
     args = ap.parse_args()
     scales = args.scales.split(",")
-    raw_root, store = args.root / "raw" / "us", args.root / "store" / "us"
+    raw_root, store = args.root / "raw" / "us", args.root / "store" / args.out_name
     tmp = store / "_tmp"
     shutil.rmtree(tmp, ignore_errors=True)
     for s in scales:
@@ -121,6 +128,8 @@ def main() -> None:
     uni = pd.read_parquet(raw_root / "universe" / "monthly_top1000.parquet")
     uni = uni[uni["month"] >= pd.Timestamp(args.start)]
     syms = sorted(set(plan["symbol"]) | set(uni["symbol"]))
+    if args.symbols:
+        syms = [s for s in syms if s in set(args.symbols.split(","))]
     inst = pd.DataFrame({"idx": np.arange(len(syms)), "key": syms, "vocab": np.arange(len(syms)) + 1,
                          "market": 1, "chain": 0})
     store.mkdir(parents=True, exist_ok=True)
@@ -149,15 +158,18 @@ def main() -> None:
     train_end_ns = TRAIN_END.value
     for s in scales:
         files = sorted((tmp / s).glob("*.npz"), key=lambda p: int(p.stem))
-        pick = rng.choice(len(files), size=min(len(files), 400), replace=False)
-        samp = []
-        for k in pick:
-            z = np.load(files[k])
-            r = z["raw"][z["ts"] <= train_end_ns]
-            samp.append(r[rng.choice(len(r), size=min(len(r), args.stats_sample // 400 + 1), replace=False)] if len(r) else r)
-        stats[s] = fit_stats(np.concatenate(samp))
         grid, cal = us_grid(s, str((pd.Timestamp(args.start) - pd.Timedelta(days=DAILY_LOOKBACK_DAYS if s == "1d" else 0)).date()),
                             args.end)
+        first_of = cal[:, CAL_FIRST] > 0.5
+        pick = rng.choice(len(files), size=min(len(files), 400), replace=False)
+        samp, firsts = [], []
+        for k in pick:
+            z = np.load(files[k])
+            keep = np.flatnonzero(z["ts"] <= train_end_ns)
+            keep = rng.choice(keep, size=min(len(keep), args.stats_sample // 400 + 1), replace=False) if len(keep) else keep
+            samp.append(z["raw"][keep])
+            firsts.append(first_of[np.searchsorted(grid, z["ts"][keep])])
+        stats[s] = fit_stats(np.concatenate(samp), np.concatenate(firsts))
 
         def parts(files=files, grid=grid):
             for f in files:
