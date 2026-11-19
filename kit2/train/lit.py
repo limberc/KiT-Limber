@@ -13,11 +13,10 @@ import lightning as L
 import torch
 from torch.utils.data import DataLoader, IterableDataset
 
-from kit2.model import KiT2
+from kit2.model import KiT2, flow_loss
 from kit2.model.config import preset
-from kit2.model.kit2 import flow_loss
-from kit2.train.batch import assemble, audit, model_inputs, synthetic_meta, synthetic_windows
-from kit2.train.buckets import SCALE_ID, SCALE_SECONDS, Bucket
+from .batch import assemble, audit, model_inputs, synthetic_meta, synthetic_windows
+from .buckets import SCALE_ID, SCALE_SECONDS, Bucket
 
 SPLIT_ID = {"train": 0, "val": 1, "test": 2}
 
@@ -33,8 +32,8 @@ class KiT2Lit(L.LightningModule):
 
     def configure_model(self) -> None:
         if self.hparams.compile and not getattr(self, "_compiled", False):
-            torch._dynamo.config.recompile_limit = 64        # one graph per bucket shape
-            self.model.compile(dynamic=False)                # in place: state_dict keys stay unchanged
+            torch._dynamo.config.recompile_limit = 64  # one graph per bucket shape
+            self.model.compile(dynamic=False)  # in place: state_dict keys stay unchanged
             self._compiled = True
 
     def _loss(self, b: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -123,7 +122,7 @@ class SyntheticData(L.LightningDataModule):
         return b
 
     def on_after_batch_transfer(self, batch: Dict[str, torch.Tensor], dataloader_idx: int) -> Dict[str, torch.Tensor]:
-        k = int(batch["bucket"])                     # batch = a sampling plan; assembled here, on the GPU
+        k = int(batch["bucket"])  # batch = a sampling plan; assembled here, on the GPU
         if k not in self._cache:
             self._cache[k] = self.make(k, batch["bucket"].device)
         b = self._cache[k]
