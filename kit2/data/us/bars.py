@@ -66,9 +66,12 @@ def minutes_utc(raw: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_intraday(raw: pd.DataFrame, scale: str, months: Iterable[pd.Period],
-                   splits: Optional[pd.DataFrame] = None, divs: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+                   splits: Optional[pd.DataFrame] = None, divs: Optional[pd.DataFrame] = None,
+                   asof: Optional[pd.Timestamp] = None) -> pd.DataFrame:
     """raw: concatenated Alpha Vantage 1-min rows (ts_start, open, high, low, close, volume), extended hours.
-    months: covered months (Period 'M') - the download plan for this symbol, known before each month."""
+    months: covered months (Period 'M') - the download plan for this symbol, known before each month.
+    asof: when the raw data was fetched (naive UTC); grid bars closing later are not emitted, so the
+    running month gets no flat bars for sessions that have not happened yet."""
     step = INTRADAY_MIN[scale]
     m = minutes_utc(raw)
     if m.empty:
@@ -99,6 +102,8 @@ def build_intraday(raw: pd.DataFrame, scale: str, months: Iterable[pd.Period],
     g_ts = g_open + pd.to_timedelta(np.minimum((g_j + 1) * step, g_len), unit="min").to_numpy()
     grid = pd.DataFrame({"session": g_sess, "j": g_j, "ts": g_ts})
     grid["sess_idx"] = np.repeat(cal.index[cal["session"].isin(covered["session"])].to_numpy(), n_bars)
+    if asof is not None:
+        grid = grid[grid["ts"] <= pd.Timestamp(asof)]
 
     if reg.empty or covered.empty:
         return empty(BAR_COLS)

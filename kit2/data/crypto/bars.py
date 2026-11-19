@@ -54,9 +54,11 @@ def _asof_ref(df: pd.DataFrame, ref: Optional[pd.DataFrame]) -> np.ndarray:
 
 
 def build_token_bars(swaps: pd.DataFrame, pools: pd.DataFrame, primary: Dict[pd.Period, str], scale: str,
-                     months: Iterable[pd.Period], refs: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+                     months: Iterable[pd.Period], refs: Dict[str, pd.DataFrame],
+                     asof: Optional[pd.Timestamp] = None) -> pd.DataFrame:
     """swaps: decoded swaps of the token's pools (any order); pools: oriented rows (pool, quote_is_token0,
-    quote_kind, quote_dec); primary: month -> primary pool; refs: quote_kind ('eth'/'btc') -> reference series."""
+    quote_kind, quote_dec); primary: month -> primary pool; refs: quote_kind ('eth'/'btc') -> reference series.
+    asof: when the swaps were fetched (naive UTC); no grid bars closing later are emitted."""
     step = SCALE_SECONDS[scale]
     months = sorted(set(pd.PeriodIndex(list(months), freq="M")))
     if swaps.empty or not months:
@@ -97,6 +99,8 @@ def build_token_bars(swaps: pd.DataFrame, pools: pd.DataFrame, primary: Dict[pd.
     grid = np.arange(lo + step, hi + 1, step, dtype=np.int64)
     gm = pd.to_datetime(grid - 1, unit="s").to_period("M")
     grid = grid[gm.isin(months)]
+    if asof is not None:
+        grid = grid[grid <= pd.Timestamp(asof).value // 10**9]
     month_ord = pd.to_datetime(grid - 1, unit="s").to_period("M").asi8  # calendar month number per bar
     bars = pd.DataFrame(index=pd.Index(grid, name="bar")).join(px).join(flow)
     bars = fill_flat(bars, ("dvol", "buy", "n_min"), segments(month_ord))
