@@ -32,15 +32,21 @@ def llama_config(cfg: ModelConfig) -> LlamaConfig:
 
 
 class RotaryAt(nn.Module):
-    """cos/sin at arbitrary float positions [B, L] (Llama RoPE frequencies)."""
+    """cos/sin at arbitrary float positions [B, L] with Llama's RoPE frequencies.
+
+    The frequencies are a plain fp32 constant, not a buffer: under bf16-true training Lightning casts every
+    floating buffer to bf16, and bf16 frequencies would be off by up to ~0.8 rad at position 200. The angles
+    are computed in fp32 from the (fp32) positions, then cos/sin are cast to the model dtype, as Llama does."""
 
     def __init__(self, cfg: ModelConfig) -> None:
         super().__init__()
-        self.rope = LlamaRotaryEmbedding(llama_config(cfg))
+        inv_freq, _ = LlamaRotaryEmbedding.compute_default_rope_parameters(llama_config(cfg))
+        self.inv_freq = inv_freq.float()            # not registered: never cast by .to(dtype)
 
-    def forward(self, pos: torch.Tensor) -> Rotary:
-        dummy = torch.empty(0, device=pos.device, dtype=torch.float32)
-        return self.rope(dummy, pos.float())
+    def forward(self, pos: torch.Tensor, dtype: torch.dtype) -> Rotary:
+        ang = pos.float()[..., None] * self.inv_freq.to(pos.device)
+        emb = torch.cat([ang, ang], dim=-1)
+        return emb.cos().to(dtype), emb.sin().to(dtype)
 
 
 def apply_rope(x: torch.Tensor, rot: Optional[Rotary]) -> torch.Tensor:
@@ -48,8 +54,7 @@ def apply_rope(x: torch.Tensor, rot: Optional[Rotary]) -> torch.Tensor:
     if rot is None:
         return x
     cos, sin = (rearrange(r, "n l d -> n 1 l d") for r in rot)
-    xf = x.float()
-    return (xf * cos + rotate_half(xf) * sin).to(x.dtype)
+    return x * cos + rotate_half(x) * sin
 
 
 class Attention(nn.Module):

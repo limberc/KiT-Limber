@@ -78,18 +78,23 @@ class KiT2(nn.Module):
         return (self.market_emb(b["market"]) + self.chain_emb(b["chain"]) + self.inst_emb(inst)
                 + rearrange(self.target_scale_emb(b["target_scale"]), "b d -> b 1 d"))
 
+    @property
+    def dtype(self) -> torch.dtype:
+        return self.patch_in.weight.dtype
+
     # ---- encoder -------------------------------------------------------------------------------
     def encode(self, b: Batch, cond: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """History -> memory. b: x_hist [B, G, S, P*C], tok_scale [S], tok_close [B, S] (int64),
         tok_pos [B, S] (target-patch units), tok_cal [B, S, cal], valid [B, G], inst/market/chain [B, G],
         target_scale [B]."""
         cond = self.inst_cond(b) if cond is None else cond
-        x = (self.patch_in(b["x_hist"]) + rearrange(self.cal_in(b["tok_cal"]), "b s d -> b 1 s d")
+        dt = self.dtype                                    # inputs follow the weights (bf16 in training)
+        x = (self.patch_in(b["x_hist"].to(dt)) + rearrange(self.cal_in(b["tok_cal"].to(dt)), "b s d -> b 1 s d")
              + self.scale_emb(b["tok_scale"]) + rearrange(cond, "b g d -> b g 1 d"))
         close = b["tok_close"]
         time_mask = rearrange(close, "b k -> b 1 1 k") <= rearrange(close, "b q -> b 1 q 1")   # key closes <= query
         group_mask = rearrange(b["valid"], "b g -> b 1 1 g")
-        rot = self.rotary(b["tok_pos"])
+        rot = self.rotary(b["tok_pos"], dt)
         for layer in self.enc:
             x = layer(x, time_mask, group_mask, rot)
         return {"h": self.enc_norm(x), "cond": cond}
@@ -106,13 +111,16 @@ class KiT2(nn.Module):
         b: anchor_close [B, A] (int64), anchor_pos [B, A], fut_cal [B, A, h, cal], tok_close/tok_pos, valid."""
         h = z.shape[3]
         k = torch.arange(h, device=z.device)
-        x = (self.fut_in(z) + rearrange(self.fut_cal(b["fut_cal"]), "b a h d -> b a 1 h d") + self.slot_emb(k))
+        dt = self.dtype
+        x = (self.fut_in(z.to(dt)) + rearrange(self.fut_cal(b["fut_cal"].to(dt)), "b a h d -> b a 1 h d")
+             + self.slot_emb(k))
         c = F.silu(rearrange(self.t_emb(t), "b a d -> b a 1 d") + rearrange(cond, "b g d -> b 1 g d"))
-        mod = rearrange(self.ada(c), "b a g (m d) -> b a g m d", m=DenoiserLayer.N_MOD)
+        mod = rearrange(self.ada(c), "b a g (m d) -> b a g m d",
+                        m=DenoiserLayer.N_MOD)
         fut_pos = rearrange(b["anchor_pos"], "b a -> b a 1") + 1.0 + k                      # [B, A, h]
-        rot_self = self.rotary(rearrange(fut_pos, "b a h -> (b a) h"))
-        rot_q = self.rotary(rearrange(fut_pos, "b a h -> b (a h)"))
-        rot_mem = self.rotary(b["tok_pos"])
+        rot_self = self.rotary(rearrange(fut_pos, "b a h -> (b a) h"), dt)
+        rot_q = self.rotary(rearrange(fut_pos, "b a h -> b (a h)"), dt)
+        rot_mem = self.rotary(b["tok_pos"], dt)
         mem_mask = rearrange(b["tok_close"], "b s -> b 1 s") <= rearrange(b["anchor_close"], "b a -> b a 1")
         mem_mask = repeat(mem_mask, "b a s -> b 1 (a h) s", h=h)                       # memory closes <= anchor
         group_mask = rearrange(b["valid"], "b g -> b 1 1 g")
@@ -138,7 +146,7 @@ class KiT2(nn.Module):
         rep = {k: repeat(b[k], "b a ... -> b (a k) ...", k=n_paths) for k in ("anchor_close", "anchor_pos", "fut_cal")}
         bb = {**b, **rep}
         shape = (B, A * n_paths, G, h, self.cfg.patch * self.cfg.out_channels)
-        z = torch.randn(shape, generator=generator, device=mem["h"].device)
+        z = torch.randn(shape, generator=generator, device=mem["h"].device, dtype=self.dtype)
         ts = torch.linspace(1.0, 0.0, steps + 1, device=z.device)
         for i in range(steps):
             t0, t1 = ts[i], ts[i + 1]
@@ -154,13 +162,15 @@ class KiT2(nn.Module):
 def flow_loss(model: KiT2, b: Batch, x0: torch.Tensor, weight: torch.Tensor,
               generator: Optional[torch.Generator] = None) -> torch.Tensor:
     """Rectified flow: z_t = (1 - t) x0 + t eps, target v = eps - x0, t ~ logit-normal(0, 1) per (sample, anchor).
-    x0 [B, A, G, h, P*5]; weight [B, G] (0 for padding instruments)."""
-    x0 = x0.float()
+    x0 [B, A, G, h, P*5]; weight [B, G] (0 for padding instruments). Computed in the model's dtype (bf16 in
+    training); reductions accumulate in fp32 inside the kernels."""
+    dt = model.dtype
+    x0 = x0.to(dt)
     B, A = x0.shape[:2]
     t = torch.sigmoid(torch.randn((B, A), device=x0.device, generator=generator))
-    eps = torch.randn(x0.shape, device=x0.device, generator=generator)
-    tt = rearrange(t, "b a -> b a 1 1 1")
+    eps = torch.randn(x0.shape, device=x0.device, generator=generator, dtype=dt)
+    tt = rearrange(t, "b a -> b a 1 1 1").to(dt)
     v = model(b, (1 - tt) * x0 + tt * eps, t)
-    err = reduce((v.float() - (eps - x0)).pow(2), "b a g h c -> b a g", "mean")
-    w = rearrange(weight, "b g -> b 1 g").float()
+    err = reduce((v - (eps - x0)).pow(2), "b a g h c -> b a g", "mean")
+    w = rearrange(weight, "b g -> b 1 g").to(dt)
     return (err * w).sum() / (w.sum() * A).clamp_min(1.0)
