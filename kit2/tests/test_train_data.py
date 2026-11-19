@@ -8,7 +8,7 @@ import pandas as pd
 import pytest
 import torch
 
-from kit2.data.store import CHANNELS, TRAIN_END, VAL_END, MarketStore, write_scale
+from kit2.data.store import CHANNELS, TRAIN_END, VAL_END, MarketStore, normalise, write_scale
 from kit2.data.us.prepare import us_grid
 from kit2.train.batch import ScaleWindow, assemble, audit
 from kit2.train.buckets import SCALE_ID, Bucket
@@ -20,6 +20,21 @@ SCALES = ("1h", "2h", "1d")
 N_INST = 12
 
 
+def encode(inst, pos):
+    """Clip-safe tags: instrument id in 0.25 steps, grid position as two base-16 digits in 0.25 steps."""
+    pos = np.asarray(pos)
+    return np.column_stack([np.full(len(pos), inst * 0.25), (pos % 16) * 0.25 + (pos // 16 % 16) * 0.015625])
+
+
+def expected(inst, pos, stats):
+    raw = np.zeros((len(pos), len(CHANNELS)), dtype=np.float32)
+    raw[:, :2] = encode(inst, pos)
+    return normalise(raw, stats, np.zeros(len(pos), bool))[:, :2]
+
+
+STATS = {"center": [0.0] * len(CHANNELS), "scale": [1.0] * len(CHANNELS), "gap_first_scale": 1.0}
+
+
 @pytest.fixture(scope="module")
 def root(tmp_path_factory):
     root = tmp_path_factory.mktemp("kit2data")
@@ -29,7 +44,7 @@ def root(tmp_path_factory):
                   "market": 1, "chain": 0}).to_parquet(d / "instruments.parquet")
     months = pd.date_range("2025-01-01", END, freq="MS")
     pd.DataFrame([(m, i) for m in months for i in range(N_INST)], columns=["month", "idx"]).to_parquet(d / "active.parquet")
-    stats = {"center": [0.0] * len(CHANNELS), "scale": [1.0] * len(CHANNELS), "gap_first_scale": 1.0}
+    stats = STATS
     for s in SCALES:
         start = "2025-01-02" if s == "1d" else START
         grid, cal = us_grid(s, start, END)
@@ -39,8 +54,7 @@ def root(tmp_path_factory):
             lo = int(rng.integers(0, len(grid) // 10))          # instruments start at different times
             n = len(grid) - lo
             raw = np.zeros((n, len(CHANNELS)), dtype=np.float32)
-            raw[:, 0] = i                                        # channel 0 = instrument id
-            raw[:, 1] = np.arange(lo, len(grid)) / 1e4          # channel 1 = grid position (tiny, no clipping)
+            raw[:, :2] = encode(i, np.arange(lo, len(grid)))    # channels 0/1 = instrument id, grid position
             parts.append((i, raw, np.arange(lo, len(grid)), np.zeros(n, dtype=np.int64)))
         write_scale(d / s, grid, cal, parts, stats)
     (d / "stats.json").write_text(json.dumps({"scales": {s: stats for s in SCALES}}))
@@ -82,9 +96,8 @@ def test_windows_are_exact_store_rows(root):
         for i in range(x.shape[0]):
             for g in np.flatnonzero(raw["valid"][i]):
                 inst = int(raw["inst"][i, g]) - 1
-                assert np.all(x[i, g, :, 0] == inst)                               # the right instrument
-                pos = np.round(x[i, g, :, 1].astype(np.float64) * 1e4).astype(int)
-                assert np.array_equal(pos, np.arange(start[i], start[i] + L))      # the right grid positions
+                want = expected(inst, np.arange(start[i], start[i] + L), STATS).astype(np.float32)
+                assert np.array_equal(x[i, g, :, :2], want)          # right instrument, right grid positions
     # coarse windows end at the last coarse bar closing at or before the target window's end
     tgt_end = st.scales["1h"].grid[raw["start0"] + raw["x0"].shape[2] - 1]
     for j, s in enumerate(bk.scales[1:], 1):
