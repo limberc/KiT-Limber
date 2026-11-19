@@ -14,6 +14,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import pack, rearrange, unpack
 from diffusers.models.normalization import RMSNorm as AffinelessRMSNorm
 from transformers import LlamaConfig
 from transformers.models.llama.modeling_llama import (LlamaMLP, LlamaRMSNorm, LlamaRotaryEmbedding,
@@ -46,7 +47,7 @@ def apply_rope(x: torch.Tensor, rot: Optional[Rotary]) -> torch.Tensor:
     """x [N', H', L, Dh] (after folding); rot cos/sin [N', L, Dh], one row per folded batch row."""
     if rot is None:
         return x
-    cos, sin = (r[:, None] for r in rot)
+    cos, sin = (rearrange(r, "n l d -> n 1 l d") for r in rot)
     xf = x.float()
     return (xf * cos + rotate_half(xf) * sin).to(x.dtype)
 
@@ -69,23 +70,19 @@ class Attention(nn.Module):
 
     def project_kv(self, kv: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """[N, Lk, d] -> normalised k, v [N, H, Lk, Dh] (cacheable across sampling steps)."""
-        N, L, _ = kv.shape
-        k, v = self.kv(kv).view(N, L, 2, self.h, self.dh).unbind(2)
-        return self.k_norm(k).transpose(1, 2), v.transpose(1, 2)
+        k, v = rearrange(self.kv(kv), "n l (two h d) -> two n h l d", two=2, h=self.h)
+        return self.k_norm(k), v
 
     def forward(self, x: torch.Tensor, kv: Optional[torch.Tensor] = None,
                 kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                 mask: Optional[torch.Tensor] = None, rot_q: Optional[Rotary] = None,
                 rot_k: Optional[Rotary] = None, fold: int = 1) -> torch.Tensor:
-        N, Lq, d = x.shape
-        q = self.q_norm(self.q(x).view(N, Lq, self.h, self.dh)).transpose(1, 2)        # [N, H, Lq, Dh]
+        q = self.q_norm(rearrange(self.q(x), "n l (h d) -> n h l d", h=self.h))
         k, v = kv_cache if kv_cache is not None else self.project_kv(x if kv is None else kv)
-        if fold > 1:                                   # [N, H, L, Dh] -> [N/fold, fold*H, L, Dh]
-            q, k, v = (t.reshape(N // fold, fold * self.h, t.shape[2], self.dh) for t in (q, k, v))
+        q, k, v = (rearrange(t, "(n f) h l d -> n (f h) l d", f=fold) for t in (q, k, v))
         q, k = apply_rope(q, rot_q), apply_rope(k, rot_k if rot_k is not None else rot_q)
         o = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
-        o = o.reshape(N, self.h, Lq, self.dh).transpose(1, 2).reshape(N, Lq, d)
-        return self.out(o)
+        return self.out(rearrange(o, "n (f h) l d -> (n f) l (h d)", f=fold))
 
 
 class EncoderLayer(nn.Module):
@@ -101,11 +98,11 @@ class EncoderLayer(nn.Module):
     def forward(self, x: torch.Tensor, time_mask: torch.Tensor, group_mask: torch.Tensor,
                 rot: Rotary) -> torch.Tensor:
         """x [B, G, S, d]; time_mask [B, 1, S, S]; group_mask [B, 1, 1, G]; rot over [B, S]."""
-        B, G, S, d = x.shape
-        h = self.n1(x).reshape(B * G, S, d)                                # G rows of a sample share rot/mask
-        x = x + self.time_attn(h, mask=time_mask, rot_q=rot, fold=G).view(B, G, S, d)
-        h = self.n2(x).transpose(1, 2).reshape(B * S, G, d)
-        x = x + self.group_attn(h, mask=group_mask, fold=S).view(B, S, G, d).transpose(1, 2)
+        B, G, S, _ = x.shape
+        y = rearrange(self.n1(x), "b g s d -> (b g) s d")                  # the G rows of a sample share rot/mask
+        x = x + rearrange(self.time_attn(y, mask=time_mask, rot_q=rot, fold=G), "(b g) s d -> b g s d", g=G)
+        y = rearrange(self.n2(x), "b g s d -> (b s) g d")
+        x = x + rearrange(self.group_attn(y, mask=group_mask, fold=S), "(b s) g d -> b g s d", s=S)
         return x + self.mlp(self.n3(x))
 
 
@@ -136,19 +133,19 @@ class DenoiserLayer(nn.Module):
         """x [B, A, G, h, d]; mod [B, A, G, 12, d] shared modulation; mem_kv k, v [B*G, H, S, Dh];
         mem_mask [B, 1, A*h, S]; group_mask [B, 1, 1, G]; rot_self over [B*A, h]; rot_q over [B, A*h];
         rot_mem over [B, S]."""
-        B, A, G, h, d = x.shape
-        m = (mod + self.mod_table)[:, :, :, None].unbind(dim=4)                   # each [B, A, G, 1, d]
-        # self attention over the h future slots of each (b, a, g)
-        y = modulate(self.norm(x), m[0], m[1]).reshape(B * A * G, h, d)
-        rs = tuple(r.repeat_interleave(G, 0) for r in rot_self)                   # [B*A*G, h, Dh]
-        x = x + m[2] * self.self_attn(y, rot_q=rs).view(B, A, G, h, d)
+        A, G, h = x.shape[1:4]
+        m = rearrange(mod + self.mod_table, "b a g m d -> m b a g 1 d")
+        # self attention over the h future slots of each (b, a, g); the G rows of a (b, a) share rotary
+        y = rearrange(modulate(self.norm(x), m[0], m[1]), "b a g h d -> (b a g) h d")
+        x = x + m[2] * rearrange(self.self_attn(y, rot_q=rot_self, fold=G), "(b a g) h d -> b a g h d", a=A, g=G)
         # group attention across the G instruments at each (b, a, slot)
-        y = modulate(self.norm(x), m[3], m[4]).permute(0, 1, 3, 2, 4).reshape(B * A * h, G, d)
-        x = x + m[5] * self.group_attn(y, mask=group_mask, fold=A * h).view(B, A, h, G, d).permute(0, 1, 3, 2, 4)
-        # cross attention: (b, g) rows see that instrument's memory; queries of all anchors share the row
-        y = modulate(self.norm(x), m[6], m[7]).permute(0, 2, 1, 3, 4).reshape(B * G, A * h, d)
+        y = rearrange(modulate(self.norm(x), m[3], m[4]), "b a g h d -> (b a h) g d")
+        o = self.group_attn(y, mask=group_mask, fold=A * h)
+        x = x + m[5] * rearrange(o, "(b a h) g d -> b a g h d", a=A, h=h)
+        # cross attention: (b, g) rows see that instrument's memory; all anchors' queries share the row
+        y = rearrange(modulate(self.norm(x), m[6], m[7]), "b a g h d -> (b g) (a h) d")
         o = self.cross_attn(y, kv_cache=mem_kv, mask=mem_mask, rot_q=rot_q, rot_k=rot_mem, fold=G)
-        x = x + m[8] * o.view(B, G, A, h, d).permute(0, 2, 1, 3, 4)
+        x = x + m[8] * rearrange(o, "(b g) (a h) d -> b a g h d", g=G, a=A)
         return x + m[11] * self.mlp(modulate(self.norm(x), m[9], m[10]))
 
 
@@ -163,7 +160,8 @@ def flow_time_embedding(cfg: ModelConfig) -> nn.Module:
             self.emb = TimestepEmbedding(cfg.t_emb_dim, cfg.d_model)
 
         def forward(self, t: torch.Tensor) -> torch.Tensor:
-            return self.emb(self.proj(t.reshape(-1) * 1000.0).to(self.emb.linear_1.weight.dtype)).view(
-                *t.shape, -1)
+            flat, ps = pack([t], "*")
+            e = self.emb(self.proj(flat * 1000.0).to(self.emb.linear_1.weight.dtype))
+            return unpack(e, ps, "* d")[0]
 
     return FlowTime()

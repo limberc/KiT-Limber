@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Sequence
 
 import torch
+from einops import rearrange
 
 from kit2.model.config import ModelConfig
 
@@ -35,7 +36,7 @@ def assemble(windows: Sequence[ScaleWindow], anchors: torch.Tensor, horizon: int
         B, G, L, C = w.x.shape
         n = L // P
         end = w.start[:, None] + (torch.arange(n, device=w.x.device) + 1) * P - 1          # [B, n]
-        toks.append(w.x.reshape(B, G, n, P * C))
+        toks.append(rearrange(w.x, "b g (n p) c -> b g n (p c)", p=P))
         closes.append(w.grid_ts[end])
         cals.append(w.grid_cal[end])
         sids.append(torch.full((n,), w.scale_id, dtype=torch.long, device=w.x.device))
@@ -52,14 +53,14 @@ def assemble(windows: Sequence[ScaleWindow], anchors: torch.Tensor, horizon: int
         raise ValueError("anchor + horizon must lie inside the target window")
     bi = torch.arange(B, device=anchors.device)
     gi = torch.arange(G, device=anchors.device)
-    tgt_tok = toks[0].view(B, G, n_t, P, C)[..., : cfg.out_channels].reshape(B, G, n_t, P * cfg.out_channels)
+    tgt_tok = rearrange(tgt.x[..., : cfg.out_channels], "b g (n p) c -> b g n (p c)", p=P)
     x0 = tgt_tok[bi[:, None, None, None], gi[None, None, :, None], fut[:, :, None, :]]   # [B, A, G, h, P*out]
     bar = tgt.start[:, None, None, None] + fut[..., None] * P + torch.arange(P, device=anchors.device)
     return {
         "x_hist": torch.cat(toks, 2), "tok_scale": torch.cat(sids), "tok_close": tok_close, "tok_pos": tok_pos,
         "tok_cal": torch.cat(cals, 1), "anchor_close": closes[0][bi[:, None], anchors],
         "anchor_pos": (anchors + 1).float(), "fut_cal": cals[0][bi[:, None, None], fut],
-        "x0": x0, "fut_ts": tgt.grid_ts[bar.reshape(B, A, horizon * P)], **meta,
+        "x0": x0, "fut_ts": tgt.grid_ts[rearrange(bar, "b a h p -> b a (h p)")], **meta,
     }
 
 

@@ -18,6 +18,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange, reduce, repeat
 from diffusers.models.normalization import RMSNorm as AffinelessRMSNorm
 from transformers.models.llama.modeling_llama import LlamaRMSNorm
 
@@ -75,7 +76,7 @@ class KiT2(nn.Module):
         if self.training and self.cfg.inst_dropout > 0:
             inst = torch.where(torch.rand(inst.shape, device=inst.device) < self.cfg.inst_dropout, 0, inst)
         return (self.market_emb(b["market"]) + self.chain_emb(b["chain"]) + self.inst_emb(inst)
-                + self.target_scale_emb(b["target_scale"])[:, None])
+                + rearrange(self.target_scale_emb(b["target_scale"]), "b d -> b 1 d"))
 
     # ---- encoder -------------------------------------------------------------------------------
     def encode(self, b: Batch, cond: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
@@ -83,11 +84,11 @@ class KiT2(nn.Module):
         tok_pos [B, S] (target-patch units), tok_cal [B, S, cal], valid [B, G], inst/market/chain [B, G],
         target_scale [B]."""
         cond = self.inst_cond(b) if cond is None else cond
-        x = (self.patch_in(b["x_hist"]) + self.cal_in(b["tok_cal"])[:, None]
-             + self.scale_emb(b["tok_scale"])[None, None] + cond[:, :, None])
+        x = (self.patch_in(b["x_hist"]) + rearrange(self.cal_in(b["tok_cal"]), "b s d -> b 1 s d")
+             + self.scale_emb(b["tok_scale"]) + rearrange(cond, "b g d -> b g 1 d"))
         close = b["tok_close"]
-        time_mask = (close[:, None, :] <= close[:, :, None])[:, None]  # [B, 1, S(query), S(key)]
-        group_mask = b["valid"][:, None, None, :]  # [B, 1, 1, G]
+        time_mask = rearrange(close, "b k -> b 1 1 k") <= rearrange(close, "b q -> b 1 q 1")   # key closes <= query
+        group_mask = rearrange(b["valid"], "b g -> b 1 1 g")
         rot = self.rotary(b["tok_pos"])
         for layer in self.enc:
             x = layer(x, time_mask, group_mask, rot)
@@ -95,8 +96,7 @@ class KiT2(nn.Module):
 
     def memory_kv(self, h: torch.Tensor) -> List[Tuple[torch.Tensor, torch.Tensor]]:
         """Per denoiser layer, cross-attention k/v of the encoder states: computed once, reused every step."""
-        B, G, S, d = h.shape
-        flat = h.reshape(B * G, S, d)
+        flat = rearrange(h, "b g s d -> (b g) s d")
         return [layer.cross_attn.project_kv(flat) for layer in self.dec]
 
     # ---- denoiser ------------------------------------------------------------------------------
@@ -104,21 +104,21 @@ class KiT2(nn.Module):
                 mem_kv: List[Tuple[torch.Tensor, torch.Tensor]]) -> torch.Tensor:
         """Velocity for the noisy future z [B, A, G, h, P*5] at flow time t [B, A] (1 = noise).
         b: anchor_close [B, A] (int64), anchor_pos [B, A], fut_cal [B, A, h, cal], tok_close/tok_pos, valid."""
-        B, A, G, h, _ = z.shape
+        h = z.shape[3]
         k = torch.arange(h, device=z.device)
-        x = (self.fut_in(z) + self.fut_cal(b["fut_cal"])[:, :, None] + self.slot_emb(k))
-        c = F.silu(self.t_emb(t)[:, :, None] + cond[:, None])  # [B, A, G, d]
-        mod = self.ada(c).unflatten(-1, (DenoiserLayer.N_MOD, -1))  # [B, A, G, 12, d]
-        fut_pos = b["anchor_pos"][:, :, None] + 1.0 + k  # [B, A, h]
-        rot_self = self.rotary(fut_pos.reshape(B * A, h))
-        rot_q = self.rotary(fut_pos.reshape(B, A * h))
+        x = (self.fut_in(z) + rearrange(self.fut_cal(b["fut_cal"]), "b a h d -> b a 1 h d") + self.slot_emb(k))
+        c = F.silu(rearrange(self.t_emb(t), "b a d -> b a 1 d") + rearrange(cond, "b g d -> b 1 g d"))
+        mod = rearrange(self.ada(c), "b a g (m d) -> b a g m d", m=DenoiserLayer.N_MOD)
+        fut_pos = rearrange(b["anchor_pos"], "b a -> b a 1") + 1.0 + k                      # [B, A, h]
+        rot_self = self.rotary(rearrange(fut_pos, "b a h -> (b a) h"))
+        rot_q = self.rotary(rearrange(fut_pos, "b a h -> b (a h)"))
         rot_mem = self.rotary(b["tok_pos"])
-        mem_mask = (b["tok_close"][:, None, :] <= b["anchor_close"][:, :, None])  # [B, A, S]
-        mem_mask = mem_mask[:, :, None].expand(B, A, h, -1).reshape(B, 1, A * h, -1)
-        group_mask = b["valid"][:, None, None, :]
+        mem_mask = rearrange(b["tok_close"], "b s -> b 1 s") <= rearrange(b["anchor_close"], "b a -> b a 1")
+        mem_mask = repeat(mem_mask, "b a s -> b 1 (a h) s", h=h)                       # memory closes <= anchor
+        group_mask = rearrange(b["valid"], "b g -> b 1 1 g")
         for layer, kv in zip(self.dec, mem_kv):
             x = layer(x, mod, kv, mem_mask, group_mask, rot_self, rot_q, rot_mem)
-        shift, scale = (mod[..., :2, :] + self.final_table)[:, :, :, None].unbind(dim=4)
+        shift, scale = rearrange(mod[..., :2, :] + self.final_table, "b a g m d -> m b a g 1 d")
         return self.out(modulate(self.final_norm(x), shift, scale))
 
     def forward(self, b: Batch, z: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
@@ -135,7 +135,7 @@ class KiT2(nn.Module):
         kv = self.memory_kv(mem["h"])
         B, A = b["anchor_close"].shape
         G, h = b["valid"].shape[1], b["fut_cal"].shape[2]
-        rep = {k: b[k].repeat_interleave(n_paths, 1) for k in ("anchor_close", "anchor_pos", "fut_cal")}
+        rep = {k: repeat(b[k], "b a ... -> b (a k) ...", k=n_paths) for k in ("anchor_close", "anchor_pos", "fut_cal")}
         bb = {**b, **rep}
         shape = (B, A * n_paths, G, h, self.cfg.patch * self.cfg.out_channels)
         z = torch.randn(shape, generator=generator, device=mem["h"].device)
@@ -148,7 +148,7 @@ class KiT2(nn.Module):
                 v2 = self.denoise(z1, t1.expand(B, A * n_paths), bb, mem["cond"], kv)
                 v = 0.5 * (v + v2)
             z = z - (t0 - t1) * v
-        return z.view(B, A, n_paths, G, h, -1)
+        return rearrange(z, "b (a k) g h c -> b a k g h c", k=n_paths)
 
 
 def flow_loss(model: KiT2, b: Batch, x0: torch.Tensor, weight: torch.Tensor,
@@ -159,8 +159,8 @@ def flow_loss(model: KiT2, b: Batch, x0: torch.Tensor, weight: torch.Tensor,
     B, A = x0.shape[:2]
     t = torch.sigmoid(torch.randn((B, A), device=x0.device, generator=generator))
     eps = torch.randn(x0.shape, device=x0.device, generator=generator)
-    tt = t[:, :, None, None, None]
+    tt = rearrange(t, "b a -> b a 1 1 1")
     v = model(b, (1 - tt) * x0 + tt * eps, t)
-    err = (v.float() - (eps - x0)).pow(2).mean(dim=(-1, -2))  # [B, A, G]
-    w = weight[:, None, :].float()
+    err = reduce((v.float() - (eps - x0)).pow(2), "b a g h c -> b a g", "mean")
+    w = rearrange(weight, "b g -> b 1 g").float()
     return (err * w).sum() / (w.sum() * A).clamp_min(1.0)

@@ -1,6 +1,8 @@
 torch>=2.4
 transformers>=5.23   # Llama RMSNorm / SwiGLU MLP / RoPE layers
 diffusers>=0.43     # timestep embedding, attention backend dispatch
+einops>=0.8           # tensor rearrangement (traced by torch.compile)
+lightning>=2.6        # KiT-2 trainer
 kernels             # optional: hub kernels (Liger RMSNorm/SwiGLU, flash/sage attention)
 numpy
 pandas
