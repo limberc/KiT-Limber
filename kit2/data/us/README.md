@@ -1,6 +1,6 @@
 # US data download (`USDownloader`)
 
-`kit2/data/download_us.py` downloads raw US equity data from Alpha Vantage for KiT-2. It has five phases, and each one
+`kit2/data/us/download.py` downloads raw US equity data from Alpha Vantage for KiT-2. It has five phases, and each one
 skips work whose output already exists. If a run is interrupted, start the same command again and it picks up where it
 stopped.
 
@@ -23,7 +23,7 @@ time or UTC; the bar builder does that later.
 3. The data root is `$KIT2_DATA`, default `/workspace/kit2/data`. Override it with `--root`.
 
  ```bash
-python -m kit2.data.download_us \
+python -m kit2.data.us.download \
   --phases listings,daily,universe,corp,intraday \
   --top 1000 \
   --end 2026-11-17 \

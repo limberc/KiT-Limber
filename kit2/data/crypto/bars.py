@@ -77,7 +77,7 @@ def build_token_bars(swaps: pd.DataFrame, pools: pd.DataFrame, primary: Dict[pd.
     sw["lp_ref"] = lp_ref
     q_amt = np.where(sw["quote_is_token0"], sw["amount0"], sw["amount1"])
     sw["usd"] = np.abs(q_amt) / 10.0 ** sw["quote_dec"].to_numpy() * np.exp(sw["lp_ref"])
-    sw["buy_usd"] = np.where(q_amt > 0, sw["usd"], 0.0)            # quote paid into the pool = base bought
+    sw["buy_usd"] = np.where(q_amt > 0, sw["usd"], 0.0)  # quote paid into the pool = base bought
     sw = sw[np.isfinite(sw["usd"])]
     sw["bar"] = ((sw["ts"].to_numpy(np.int64) - 1) // step + 1) * step
 
@@ -92,12 +92,12 @@ def build_token_bars(swaps: pd.DataFrame, pools: pd.DataFrame, primary: Dict[pd.
                                  traders=("tx_from", "nunique"), gas=("base_fee_gwei", "median"))
 
     # full UTC grid over covered months, from the first priced bar
-    lo = pd.Timestamp(months[0].start_time).value // 10**9
-    hi = pd.Timestamp((months[-1] + 1).start_time).value // 10**9
+    lo = pd.Timestamp(months[0].start_time).value // 10 ** 9
+    hi = pd.Timestamp((months[-1] + 1).start_time).value // 10 ** 9
     grid = np.arange(lo + step, hi + 1, step, dtype=np.int64)
     gm = pd.to_datetime(grid - 1, unit="s").to_period("M")
     grid = grid[gm.isin(months)]
-    month_ord = pd.to_datetime(grid - 1, unit="s").to_period("M").asi8      # calendar month number per bar
+    month_ord = pd.to_datetime(grid - 1, unit="s").to_period("M").asi8  # calendar month number per bar
     bars = pd.DataFrame(index=pd.Index(grid, name="bar")).join(px).join(flow)
     bars = fill_flat(bars, ("dvol", "buy", "n_min"), segments(month_ord))
     if bars is None:

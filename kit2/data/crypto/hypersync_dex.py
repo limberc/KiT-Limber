@@ -166,8 +166,9 @@ class Dex:
                     raise
                 await asyncio.sleep(2 ** attempt)
 
-    async def pools(self) -> pd.DataFrame:
-        """Every pool created by the Uniswap v3 factory: pool, token0, token1, fee, tick_spacing, block."""
+    async def pools(self, from_block: Optional[int] = None) -> pd.DataFrame:
+        """Pools created by the Uniswap v3 factory from `from_block` (default: the factory's deployment):
+        pool, token0, token1, fee, tick_spacing, block."""
         parts: List[pd.DataFrame] = []
 
         def on_batch(d):
@@ -182,11 +183,15 @@ class Dex:
                 "pool": _addr_from_word([x[66:130] for x in logs["data"]]),
             }))
 
-        q = Query(from_block=self.chain.factory_block,
+        q = Query(from_block=self.chain.factory_block if from_block is None else from_block,
                   logs=[LogSelection(address=[self.chain.factory], topics=[[POOL_CREATED_T0]])],
                   field_selection=FieldSelection(log=[LogField.BLOCK_NUMBER, LogField.TOPIC1, LogField.TOPIC2,
                                                       LogField.TOPIC3, LogField.DATA]))
         await self._scan(q, on_batch, await self.height())
+        if not parts:
+            return pd.DataFrame({"block": pd.Series(dtype=np.int64), "token0": [], "token1": [],
+                                 "fee": pd.Series(dtype=np.int64), "tick_spacing": pd.Series(dtype=np.int64),
+                                 "pool": []})
         return pd.concat(parts, ignore_index=True)
 
     async def activity(self, from_block: int, to_block: int,
@@ -209,6 +214,11 @@ class Dex:
                   field_selection=FieldSelection(block=[BlockField.NUMBER, BlockField.TIMESTAMP],
                                                  log=[LogField.ADDRESS, LogField.BLOCK_NUMBER]))
         await self._scan(q, on_batch, to_block, progress=progress)
+        if not counts:                               # no swaps in the range (e.g. before a chain's launch)
+            return (pd.DataFrame({"pool": [], "day": pd.Series(dtype="datetime64[ns]"),
+                                  "n_swaps": pd.Series(dtype=np.int64)}),
+                    pd.DataFrame({"day": pd.Series(dtype="datetime64[ns]"),
+                                  "first_block": pd.Series(dtype=np.int64)}))
         act = pd.concat(counts).groupby(["address", "day"], as_index=False)["n_swaps"].sum()
         days = pd.concat(day_blocks).groupby("day", as_index=False)["first_block"].min()
         return act.rename(columns={"address": "pool"}), days

@@ -1,4 +1,4 @@
-"""Bar schema and helpers shared by the market builders (bars_us.py, bars_crypto.py).
+"""Bar schema and helpers shared by the market builders (us/bars.py, crypto/bars.py).
 
 Every builder returns the core columns, plus its own market columns:
   ts       bar close time (naive UTC) = the time the bar becomes known

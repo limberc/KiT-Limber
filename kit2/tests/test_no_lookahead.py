@@ -9,9 +9,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from kit2.data.bars_us import ET, build_daily, build_intraday, create_cal
+from kit2.data.us.bars import ET, build_daily, build_intraday, create_cal
 from kit2.data.features import candle_features
-from kit2.data.us_universe import monthly_universe
+from kit2.data.us.universe import monthly_universe
 
 SPLIT_DAY = pd.Timestamp("2024-06-10")
 DIV_DAY = pd.Timestamp("2024-05-29")
@@ -147,7 +147,7 @@ def test_universe_uses_only_data_before_month():
 
 
 # ---- crypto ------------------------------------------------------------------------------------------
-from kit2.data.bars_crypto import build_token_bars, reference_series  # noqa: E402
+from kit2.data.crypto.bars import build_token_bars, reference_series  # noqa: E402
 
 CRYPTO_MONTHS = list(pd.period_range("2025-01", "2025-02", freq="M"))
 

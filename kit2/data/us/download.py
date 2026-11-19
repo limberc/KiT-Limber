@@ -1,6 +1,6 @@
 """Resumable US downloader (Alpha Vantage). Every phase skips work whose output already exists.
 
-Usage: python -m kit2.data.download_us [--phases listings,daily,universe,corp,intraday] [--top 1000]
+Usage: python -m kit2.data.us.download [--phases listings,daily,universe,corp,intraday] [--top 1000]
 
 Layout under <data_root>/raw/us/:
   listing/{active,delisted}.csv          listing snapshot (download date in listing/meta.json)

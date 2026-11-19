@@ -1,6 +1,6 @@
 """Resumable on-chain DEX downloader (Envio HyperSync, Uniswap v3 pools). One chain per process.
 
-Usage: python -m kit2.data.download_crypto --chain eth [--phases pools,anchors,activity,candidates,swaps]
+Usage: python -m kit2.data.crypto.download --chain eth [--phases pools,anchors,activity,candidates,swaps]
 
 Layout under <data_root>/raw/crypto/<chain>/:
   pools.parquet                every Uniswap v3 pool: pool, token0, token1, fee, tick_spacing, block (created)
@@ -69,10 +69,14 @@ class CryptoDownloader:
 
     # ---- pools ---------------------------------------------------------------------------------
     def pools(self) -> None:
+        """Pool registry; each run appends pools created after the newest one already saved."""
         out = self.root / "pools.parquet"
-        df = asyncio.run(self.dex.pools())  # always refreshed: new pools appear every day
-        atomic_write_parquet(df, out)
-        log(f"[pools] {len(df)} pools")
+        have = pd.read_parquet(out) if out.is_file() else None
+        start = int(have["block"].max()) if have is not None and len(have) else None   # re-scan that block
+        new = asyncio.run(self.dex.pools(from_block=start))
+        df = new if have is None else pd.concat([have, new], ignore_index=True).drop_duplicates("pool")
+        atomic_write_parquet(df.sort_values(["block", "pool"]).reset_index(drop=True), out)
+        log(f"[pools] {len(df)} pools ({len(df) - (0 if have is None else len(have))} new)")
 
     # ---- month anchors -------------------------------------------------------------------------
     def anchors(self) -> None:
@@ -124,7 +128,8 @@ class CryptoDownloader:
                 hi = self._approx_block(blk, m - pd.Timedelta(days=d - 1))
                 act, _ = asyncio.run(self.dex.activity(lo, hi))
                 parts.append(act)
-            act = pd.concat(parts).groupby("pool", as_index=False)["n_swaps"].sum()
+            act = pd.concat(parts).groupby("pool", as_index=False)["n_swaps"].sum()   # may be empty: then no
+            # candidates that month, and the empty file stops it being re-scanned
             atomic_write_parquet(act.assign(month=m, sample_days=len(SAMPLE_DAYS)), out)
             log(f"[activity] {m:%Y-%m}: {len(act)} pools, {int(act['n_swaps'].sum())} sampled swaps, "
                 f"{time.time() - t:.0f}s")
@@ -140,6 +145,8 @@ class CryptoDownloader:
             if not f.is_file():
                 continue
             act = pd.read_parquet(f).merge(pools[["pool", "base", "quote_kind", "block"]], on="pool")
+            if act.empty:
+                continue
             season_block = self._approx_block(blk, m - pd.Timedelta(days=SEASON_DAYS))
             act = act[act["block"] <= season_block].sort_values("n_swaps", ascending=False)
             top_pools = act.groupby("base").head(POOLS_PER_TOKEN)
