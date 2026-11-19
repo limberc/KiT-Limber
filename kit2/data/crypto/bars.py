@@ -13,7 +13,7 @@ decimals are a constant factor per token, so every candle feature (a log ratio) 
 """
 from __future__ import annotations
 
-from typing import Dict, Iterable, Optional
+from typing import Dict, Iterable, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -59,17 +59,17 @@ def build_token_bars(swaps: pd.DataFrame, pools: pd.DataFrame, primary: Dict[pd.
     """swaps: decoded swaps of the token's pools (any order); pools: oriented rows (pool, quote_is_token0,
     quote_kind, quote_dec); primary: month -> primary pool; refs: quote_kind ('eth'/'btc') -> reference series.
     asof: when the swaps were fetched (naive UTC); no grid bars closing later are emitted."""
-    step = SCALE_SECONDS[scale]
-    months = sorted(set(pd.PeriodIndex(list(months), freq="M")))
-    if swaps.empty or not months:
-        return empty(BAR_COLS)
+    return build_token_bars_multi(swaps, pools, primary, [scale], months, refs, asof).get(scale, empty(BAR_COLS))
+
+
+def prepare_swaps(swaps: pd.DataFrame, pools: pd.DataFrame, months, refs: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Scale-independent per-swap preparation: quote orientation, month, USD conversion, buy flow."""
     sw = swaps.merge(pools[["pool", "quote_is_token0", "quote_kind", "quote_dec"]], on="pool", how="inner")
     sw = sw.sort_values(["block", "log_index"]).reset_index(drop=True)
     sw["month"] = pd.to_datetime(sw["ts"], unit="s").dt.to_period("M")
     sw = sw[sw["month"].isin(months)]
     if sw.empty:
-        return empty(BAR_COLS)
-
+        return sw
     # USD conversion: ln(USD per quote human unit) as of each swap's block
     lp_ref = np.zeros(len(sw))
     for kind, ref in refs.items():
@@ -80,8 +80,26 @@ def build_token_bars(swaps: pd.DataFrame, pools: pd.DataFrame, primary: Dict[pd.
     q_amt = np.where(sw["quote_is_token0"], sw["amount0"], sw["amount1"])
     sw["usd"] = np.abs(q_amt) / 10.0 ** sw["quote_dec"].to_numpy() * np.exp(sw["lp_ref"])
     sw["buy_usd"] = np.where(q_amt > 0, sw["usd"], 0.0)  # quote paid into the pool = base bought
-    sw = sw[np.isfinite(sw["usd"])]
-    sw["bar"] = ((sw["ts"].to_numpy(np.int64) - 1) // step + 1) * step
+    return sw[np.isfinite(sw["usd"])]
+
+
+def build_token_bars_multi(swaps: pd.DataFrame, pools: pd.DataFrame, primary: Dict[pd.Period, str], scales,
+                           months: Iterable[pd.Period], refs: Dict[str, pd.DataFrame],
+                           asof: Optional[pd.Timestamp] = None) -> Dict[str, pd.DataFrame]:
+    """build_token_bars for several scales, sharing the per-swap preparation."""
+    months = sorted(set(pd.PeriodIndex(list(months), freq="M")))
+    if swaps.empty or not months:
+        return {s: empty(BAR_COLS) for s in scales}
+    sw = prepare_swaps(swaps, pools, months, refs)
+    if sw.empty:
+        return {s: empty(BAR_COLS) for s in scales}
+    return {s: _bars_at(sw, primary, s, months, asof) for s in scales}
+
+
+def _bars_at(sw: pd.DataFrame, primary: Dict[pd.Period, str], scale: str, months: List[pd.Period],
+             asof: Optional[pd.Timestamp]) -> pd.DataFrame:
+    step = SCALE_SECONDS[scale]
+    sw = sw.assign(bar=((sw["ts"].to_numpy(np.int64) - 1) // step + 1) * step)
 
     # price events: block-end mid of the month's primary pool, in USD per 1e18 raw base units
     is_primary = sw["pool"].to_numpy() == sw["month"].map({m: p for m, p in primary.items()}).to_numpy()
