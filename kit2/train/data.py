@@ -16,7 +16,6 @@ from typing import Dict, List, Optional
 
 import lightning as L
 import numpy as np
-import pandas as pd
 import torch
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
@@ -24,7 +23,7 @@ from kit2.data.store import CHANNELS, TRAIN_END, VAL_END, MarketStore
 from kit2.train.batch import ScaleWindow, assemble, audit
 from kit2.train.buckets import MARKET_ID, SCALE_ID, Bucket
 
-ALWAYS = {"us": ("SPY", "QQQ")}          # market anchors put in every US group when covered
+ALWAYS = {"us": ("SPY", "QQQ")}  # market anchors put in every US group when covered
 SPLIT_RANGE = {"train": (None, TRAIN_END), "val": (TRAIN_END, VAL_END), "test": (VAL_END, None)}
 
 
@@ -62,7 +61,7 @@ class GroupSampler:
             ok &= grid[first_target] > self.lo_ns
         if self.hi_ns is not None:
             ok &= grid[e] <= self.hi_ns
-        for s, n in zip(bk.scales[1:], bk.n_patches[1:]):            # coarse history must exist on its grid
+        for s, n in zip(bk.scales[1:], bk.n_patches[1:]):  # coarse history must exist on its grid
             if s not in st.scales:
                 return np.zeros(0, dtype=np.int64)
             gc = st.scales[s].grid
@@ -82,7 +81,7 @@ class GroupSampler:
         inst = np.zeros((B, G), dtype=np.int64)
         valid = np.zeros((B, G), dtype=bool)
         for i in range(B):
-            for _ in range(8):                                      # retry moments with no covered instrument
+            for _ in range(8):  # retry moments with no covered instrument
                 e = int(ends[rng.integers(len(ends))])
                 act = st.active_at(int(tgt.grid[e]))
                 if act is not None and len(act):
@@ -127,7 +126,7 @@ class _Stream(IterableDataset):
         wi = get_worker_info()
         wid, nw = (wi.id, wi.num_workers) if wi else (0, 1)
         if self.sampler is None:
-            self.sampler = GroupSampler(**self.args)                # memmaps opened inside the worker
+            self.sampler = GroupSampler(**self.args)  # memmaps opened inside the worker
         rng = np.random.default_rng([self.seed, wid])
         p = self.w / self.w.sum()
         i = 0

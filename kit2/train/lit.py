@@ -36,8 +36,23 @@ class KiT2Lit(L.LightningModule):
             self.model.compile(dynamic=False)  # in place: state_dict keys stay unchanged
             self._compiled = True
 
-    def _loss(self, b: Dict[str, torch.Tensor]) -> torch.Tensor:
-        return flow_loss(self.model, model_inputs(b), b["x0"], b["valid"])
+    def model_dtype(self) -> torch.dtype:
+        return next(self.model.parameters()).dtype
+
+    def setup(self, stage: str) -> None:
+        dm = getattr(self.trainer, "datamodule", None)
+        if dm is not None and getattr(dm, "bucket_names", None):
+            self.bucket_names = dm.bucket_names
+
+    def _loss(self, b: Dict[str, torch.Tensor], generator: Optional[torch.Generator] = None) -> torch.Tensor:
+        return flow_loss(self.model, model_inputs(b), b["x0"], b["valid"], generator=generator)
+
+    def on_before_optimizer_step(self, optimizer) -> None:
+        # clipping here, not via Trainer(gradient_clip_val): Lightning refuses that with fused AdamW
+        clip = self.hparams.optim.get("grad_clip", 1.0)
+        if clip:
+            norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip)
+            self.log("train/grad_norm", norm, on_step=True, batch_size=1)
 
     def training_step(self, b: Dict[str, torch.Tensor], idx: int) -> torch.Tensor:
         loss = self._loss(b)
@@ -45,7 +60,8 @@ class KiT2Lit(L.LightningModule):
         return loss
 
     def validation_step(self, b: Dict[str, torch.Tensor], idx: int) -> None:
-        loss = self._loss(b)
+        # fixed flow times and noise per validation batch, so val loss is comparable across checkpoints
+        loss = self._loss(b, torch.Generator(device=self.device).manual_seed(1000 + idx))
         name = self.bucket_names[int(b["bucket"])] if self.bucket_names else "all"
         self.log("val/loss", loss, prog_bar=True, on_epoch=True, batch_size=1)
         self.log(f"val/loss_{name}", loss, on_epoch=True, batch_size=1)
@@ -55,11 +71,17 @@ class KiT2Lit(L.LightningModule):
         decay, no_decay = [], []
         for n, p in self.model.named_parameters():
             (decay if p.dim() >= 2 and "emb" not in n else no_decay).append(p)
-        opt = torch.optim.AdamW([
-            {"params": decay, "weight_decay": o.get("weight_decay", 0.1)},
-            {"params": no_decay, "weight_decay": 0.0}],
-            lr=o.get("lr", 3e-4), betas=(0.9, 0.95), eps=1e-8, fused=torch.cuda.is_available()
-        )
+        groups = [{"params": decay, "weight_decay": o.get("weight_decay", 0.1)},
+                  {"params": no_decay, "weight_decay": 0.0}]
+        if self.model_dtype() == torch.bfloat16:
+            # precision="bf16-true" (opt-in): weights and AdamW state in bf16; stochastic rounding keeps small
+            # updates from rounding away (round-to-nearest bf16 training stalls)
+            from torchao.optim import _AdamW
+            opt = _AdamW(groups, lr=o.get("lr", 3e-4), betas=(0.9, 0.95), eps=1e-8, bf16_stochastic_round=True)
+        else:
+            # precision="bf16-mixed" (default): bf16 compute, fp32 master weights + optimizer state
+            opt = torch.optim.AdamW(groups, lr=o.get("lr", 3e-4), betas=(0.9, 0.95), eps=1e-8,
+                                    fused=torch.cuda.is_available())
         warmup, total, floor = (o.get("warmup_steps", 1000),
                                 o.get("total_steps", 100_000),
                                 o.get("min_lr_ratio", 0.1))
@@ -110,7 +132,8 @@ class SyntheticData(L.LightningDataModule):
         self._cache: Dict[int, Dict[str, torch.Tensor]] = {}
 
     def train_dataloader(self) -> DataLoader:
-        return DataLoader(_Plans(self.weights, self.seed), batch_size=None, num_workers=0)
+        return DataLoader(_Plans(self.weights, self.seed), batch_size=None,
+                          num_workers=0)
 
     def make(self, k: int, device) -> Dict[str, torch.Tensor]:
         bk = self.buckets[k]
