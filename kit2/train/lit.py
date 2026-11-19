@@ -55,10 +55,14 @@ class KiT2Lit(L.LightningModule):
         decay, no_decay = [], []
         for n, p in self.model.named_parameters():
             (decay if p.dim() >= 2 and "emb" not in n else no_decay).append(p)
-        opt = torch.optim.AdamW([{"params": decay, "weight_decay": o.get("weight_decay", 0.1)},
-                                 {"params": no_decay, "weight_decay": 0.0}],
-                                lr=o.get("lr", 3e-4), betas=(0.9, 0.95), eps=1e-8, fused=torch.cuda.is_available())
-        warmup, total, floor = o.get("warmup_steps", 1000), o.get("total_steps", 100_000), o.get("min_lr_ratio", 0.1)
+        opt = torch.optim.AdamW([
+            {"params": decay, "weight_decay": o.get("weight_decay", 0.1)},
+            {"params": no_decay, "weight_decay": 0.0}],
+            lr=o.get("lr", 3e-4), betas=(0.9, 0.95), eps=1e-8, fused=torch.cuda.is_available()
+        )
+        warmup, total, floor = (o.get("warmup_steps", 1000),
+                                o.get("total_steps", 100_000),
+                                o.get("min_lr_ratio", 0.1))
 
         def lr_at(step: int) -> float:
             if step < warmup:
