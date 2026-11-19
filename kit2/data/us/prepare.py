@@ -165,10 +165,13 @@ def main() -> None:
         samp, firsts = [], []
         for k in pick:
             z = np.load(files[k])
-            keep = np.flatnonzero(z["ts"] <= train_end_ns)
-            keep = rng.choice(keep, size=min(len(keep), args.stats_sample // 400 + 1), replace=False) if len(keep) else keep
+            train = np.flatnonzero(z["ts"] <= train_end_ns)
+            is_first = first_of[np.searchsorted(grid, z["ts"][train])]
+            rest = train[~is_first]
+            keep = np.r_[train[is_first],                   # every session-first bar (rare at fine scales)
+                         rng.choice(rest, size=min(len(rest), args.stats_sample // 400 + 1), replace=False)]
             samp.append(z["raw"][keep])
-            firsts.append(first_of[np.searchsorted(grid, z["ts"][keep])])
+            firsts.append(np.r_[np.ones(int(is_first.sum()), bool), np.zeros(len(keep) - int(is_first.sum()), bool)])
         stats[s] = fit_stats(np.concatenate(samp), np.concatenate(firsts))
 
         def parts(files=files, grid=grid):
