@@ -14,8 +14,9 @@ Channels: r_gap, r_body, r_up, r_dn, v (generated), has_obs, aux0..aux3 (history
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Callable, Dict, Iterable, List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -124,6 +125,56 @@ def write_scale(out_dir: Path, grid: np.ndarray, cal: np.ndarray, parts: Iterabl
     (out_dir / "X.npy.tmp").replace(out_dir / "X.npy")
     pd.DataFrame(runs, columns=["idx", "grid_start", "length", "offset"]).to_parquet(out_dir / "runs.parquet")
     return n_total
+
+
+def finalize_store(store: Path, tmp: Path, scales: Sequence[str], grid_of: Callable[[str], tuple],
+                   stats_sample: int = 300_000, log: Callable[[str], None] = print) -> None:
+    """Per scale: fit normalisation stats on training-period bars (ts <= TRAIN_END) of the instruments'
+    tmp/<scale>/<idx>.npz files (raw, ts, seg), then write X / runs / grid / cal; finally stats.json.
+    grid_of(scale) -> (grid int64 ns, cal float16 [n, CAL_DIM]). Removes tmp."""
+    stats, rng = {}, np.random.default_rng(0)
+    for s in scales:
+        files = sorted((tmp / s).glob("*.npz"), key=lambda p: int(p.stem))
+        if not files:
+            continue
+        grid, cal = grid_of(s)
+        first_of = cal[:, CAL_FIRST] > 0.5
+        per_file = stats_sample // 400 + 1
+        samp, firsts = [], []
+        for k in rng.choice(len(files), size=min(len(files), 400), replace=False):
+            z = np.load(files[k])
+            train = np.flatnonzero(z["ts"] <= TRAIN_END.value)
+            is_first = first_of[np.searchsorted(grid, z["ts"][train])]
+            rest = train[~is_first]
+            keep = np.r_[train[is_first],                   # every session-first bar (rare at fine scales)
+                         rng.choice(rest, size=min(len(rest), per_file), replace=False)]
+            samp.append(z["raw"][keep])
+            firsts.append(np.r_[np.ones(int(is_first.sum()), bool), np.zeros(len(keep) - int(is_first.sum()), bool)])
+        stats[s] = fit_stats(np.concatenate(samp), np.concatenate(firsts))
+
+        def parts(files=files, grid=grid, s=s):
+            for f in files:
+                z = np.load(f)
+                g = np.searchsorted(grid, z["ts"])
+                ok = (g < len(grid)) & (grid[np.minimum(g, len(grid) - 1)] == z["ts"])
+                if not ok.all():
+                    raise AssertionError(f"{f}: {int((~ok).sum())} bars are not on the {s} grid")
+                yield int(f.stem), z["raw"], g, z["seg"]
+
+        n = write_scale(store / s, grid, cal, parts(), stats[s])
+        log(f"wrote {s}: {n} bars, {len(files)} instruments, grid {len(grid)}")
+    (store / "stats.json").write_text(json.dumps({"train_end": str(TRAIN_END), "channels": list(CHANNELS),
+                                                  "cal_dim": CAL_DIM, "scales": stats}, indent=1))
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+def denormalise(y: np.ndarray, stats: Dict[str, List[float]], first: np.ndarray) -> np.ndarray:
+    """Inverse of `normalise` for the candle channels: y [..., n, C>=5] (n bars), first [n] -> raw values."""
+    c = np.asarray(stats["center"])[:N_CANDLE]
+    s = np.broadcast_to(np.asarray(stats["scale"][:N_CANDLE], dtype=np.float64), (len(first), N_CANDLE)).copy()
+    s[first, 0] = stats["gap_first_scale"]
+    r = np.clip(np.asarray(y, dtype=np.float64)[..., :N_CANDLE] / SOFT_CLIP, -(1 - 1e-6), 1 - 1e-6)
+    return np.arctanh(r) * SOFT_CLIP * s + c
 
 
 # ---- reader --------------------------------------------------------------------------------------------
