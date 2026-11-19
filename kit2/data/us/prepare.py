@@ -10,7 +10,6 @@ point-in-time monthly universe plus the context ETFs.
 from __future__ import annotations
 
 import argparse
-import json
 import shutil
 import time
 from concurrent.futures import ProcessPoolExecutor
@@ -21,7 +20,7 @@ import numpy as np
 import pandas as pd
 
 from kit2.data.features import candle_features
-from kit2.data.store import CAL_DIM, CAL_FIRST, CHANNELS, TRAIN_END, calendar_features, fit_stats, write_scale
+from kit2.data.store import calendar_features, finalize_store
 from kit2.data.us.bars import ET, INTRADAY_MIN, build_daily, build_intraday, create_cal
 from kit2.data.us.universe import CONTEXT_ETFS
 from kit2.env import data_root
@@ -71,9 +70,8 @@ def _read(p: Path) -> Optional[pd.DataFrame]:
     return pd.read_parquet(p) if p.is_file() else None
 
 
-def build_symbol(job) -> Dict[str, Optional[tuple]]:
-    """All scales for one symbol -> {scale: (raw [n, C], ts ns [n], seg [n])} written to tmp npz files."""
-    sym, idx, months, raw_root, tmp, start, scales = job
+def symbol_bars(sym: str, months, raw_root: Path, start: str, scales) -> Dict[str, pd.DataFrame]:
+    """Point-in-time bars of one symbol at every scale (the store and the evaluation both use this)."""
     out = {}
     splits = _read(raw_root / "corp" / "splits" / f"{sym}.parquet")
     divs = _read(raw_root / "corp" / "dividends" / f"{sym}.parquet")
@@ -97,8 +95,16 @@ def build_symbol(job) -> Dict[str, Optional[tuple]]:
             if raw is None:
                 continue
             bars = build_intraday(raw, scale, cover, splits, divs, asof=asof)
-        if len(bars) < 2:
-            continue
+        if len(bars) >= 2:
+            out[scale] = bars
+    return out
+
+
+def build_symbol(job) -> Dict[str, int]:
+    """All scales for one symbol -> channels written to tmp npz files; returns bar counts."""
+    sym, idx, months, raw_root, tmp, start, scales = job
+    out = {}
+    for scale, bars in symbol_bars(sym, months, raw_root, start, scales).items():
         np.savez(tmp / scale / f"{idx}.npz", raw=channels(bars, scale),
                  ts=bars["ts"].to_numpy("datetime64[ns]").astype(np.int64), seg=bars["seg"].to_numpy(np.int64))
         out[scale] = len(bars)
@@ -153,41 +159,9 @@ def main() -> None:
             if i % 200 == 0 or i == len(jobs):
                 log(f"built {i}/{len(jobs)} symbols, {time.time() - t0:.0f}s, bars so far {counts}")
 
-    # normalisation stats from training-period bars only, then write each scale
-    stats, rng = {}, np.random.default_rng(0)
-    train_end_ns = TRAIN_END.value
-    for s in scales:
-        files = sorted((tmp / s).glob("*.npz"), key=lambda p: int(p.stem))
-        grid, cal = us_grid(s, str((pd.Timestamp(args.start) - pd.Timedelta(days=DAILY_LOOKBACK_DAYS if s == "1d" else 0)).date()),
-                            args.end)
-        first_of = cal[:, CAL_FIRST] > 0.5
-        pick = rng.choice(len(files), size=min(len(files), 400), replace=False)
-        samp, firsts = [], []
-        for k in pick:
-            z = np.load(files[k])
-            train = np.flatnonzero(z["ts"] <= train_end_ns)
-            is_first = first_of[np.searchsorted(grid, z["ts"][train])]
-            rest = train[~is_first]
-            keep = np.r_[train[is_first],                   # every session-first bar (rare at fine scales)
-                         rng.choice(rest, size=min(len(rest), args.stats_sample // 400 + 1), replace=False)]
-            samp.append(z["raw"][keep])
-            firsts.append(np.r_[np.ones(int(is_first.sum()), bool), np.zeros(len(keep) - int(is_first.sum()), bool)])
-        stats[s] = fit_stats(np.concatenate(samp), np.concatenate(firsts))
-
-        def parts(files=files, grid=grid):
-            for f in files:
-                z = np.load(f)
-                g = np.searchsorted(grid, z["ts"])
-                ok = (g < len(grid)) & (grid[np.minimum(g, len(grid) - 1)] == z["ts"])
-                if not ok.all():
-                    raise AssertionError(f"{f}: {int((~ok).sum())} bars are not on the {s} grid")
-                yield int(f.stem), z["raw"], g, z["seg"]
-
-        n = write_scale(store / s, grid, cal, parts(), stats[s])
-        log(f"wrote {s}: {n} bars, {len(files)} instruments, grid {len(grid)}")
-    (store / "stats.json").write_text(json.dumps({"train_end": str(TRAIN_END), "channels": list(CHANNELS),
-                                                  "cal_dim": CAL_DIM, "scales": stats}, indent=1))
-    shutil.rmtree(tmp, ignore_errors=True)
+    lookback = {s: DAILY_LOOKBACK_DAYS if s == "1d" else 0 for s in scales}
+    finalize_store(store, tmp, scales, lambda s: us_grid(s, str((pd.Timestamp(args.start)
+                   - pd.Timedelta(days=lookback[s])).date()), args.end), args.stats_sample, log)
     log("done")
 
 
