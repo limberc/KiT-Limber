@@ -118,7 +118,7 @@ class KiT2(nn.Module):
         group_mask = rearrange(b["valid"], "b g -> b 1 1 g")
         for layer, kv in zip(self.dec, mem_kv):
             x = layer(x, mod, kv, mem_mask, group_mask, rot_self, rot_q, rot_mem)
-        shift, scale = rearrange(mod[..., :2, :] + self.final_table, "b a g m d -> m b a g 1 d")
+        shift, scale = rearrange(mod[..., :2, :] + self.final_table, "b a g m d -> b a g 1 m d").unbind(dim=4)
         return self.out(modulate(self.final_norm(x), shift, scale))
 
     def forward(self, b: Batch, z: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
