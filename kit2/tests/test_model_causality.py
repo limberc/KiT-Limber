@@ -134,3 +134,21 @@ def test_sampler_shapes(model):
     b, _ = make(7)
     out = model.sample(model_inputs(b), n_paths=3, steps=2, solver="heun", generator=torch.Generator().manual_seed(0))
     assert out.shape == (2, 3, 3, 4, H, CFG.patch * CFG.out_channels) and torch.isfinite(out).all()
+
+
+def test_pure_bf16_training_step():
+    """bf16-true: weights, activations, loss and gradients are bf16; RoPE frequencies stay exact."""
+    from kit2.model.kit2 import flow_loss
+    torch.manual_seed(1)
+    m = KiT2(CFG).to(torch.bfloat16).train()
+    b, _ = make(8)
+    loss = flow_loss(m, model_inputs(b), b["x0"], b["valid"])
+    loss.backward()
+    assert loss.dtype == torch.bfloat16 and torch.isfinite(loss)
+    assert all(p.dtype == torch.bfloat16 and p.grad is not None and p.grad.dtype == torch.bfloat16
+               for p in m.parameters() if p.requires_grad)
+    assert m.rotary.inv_freq.dtype == torch.float32
+    pos = torch.tensor([[200.0]])
+    cos, _ = m.rotary(pos, torch.float32)
+    want = torch.cos(200.0 * m.rotary.inv_freq)
+    torch.testing.assert_close(cos[0, 0, : len(want)], want, rtol=1e-5, atol=1e-5)
