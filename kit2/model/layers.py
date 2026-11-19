@@ -134,7 +134,9 @@ class DenoiserLayer(nn.Module):
         mem_mask [B, 1, A*h, S]; group_mask [B, 1, 1, G]; rot_self over [B*A, h]; rot_q over [B, A*h];
         rot_mem over [B, S]."""
         A, G, h = x.shape[1:4]
-        m = rearrange(mod + self.mod_table, "b a g m d -> m b a g 1 d")
+        # split along the modulation axis in place: moving it to the front (m b a g ...) makes inductor emit
+        # a strided reduction for the table's gradient that took 70% of a 1d training step
+        m = rearrange(mod + self.mod_table, "b a g m d -> b a g 1 m d").unbind(dim=4)
         # self attention over the h future slots of each (b, a, g); the G rows of a (b, a) share rotary
         y = rearrange(modulate(self.norm(x), m[0], m[1]), "b a g h d -> (b a g) h d")
         x = x + m[2] * rearrange(self.self_attn(y, rot_q=rot_self, fold=G), "(b a g) h d -> b a g h d", a=A, g=G)
