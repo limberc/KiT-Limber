@@ -48,10 +48,13 @@ def calendar_features(ts: np.ndarray, local_minute: np.ndarray, sess_pos: np.nda
 
 # ---- normalisation -------------------------------------------------------------------------------------
 def _robust_scale(x: np.ndarray) -> float:
+    """max(1.4826 MAD, q90(|x - median|) / 1.645): equal for Gaussian data; the quantile term keeps the scale
+    from collapsing on zero-heavy channels (intraday gaps, wicks), where MAD alone would clip the tail."""
     x = x[np.isfinite(x)]
     if x.size == 0:
         return 1.0
-    s = 1.4826 * float(np.median(np.abs(x - np.median(x))))
+    dev = np.abs(x - np.median(x))
+    s = max(1.4826 * float(np.median(dev)), float(np.quantile(dev, 0.9)) / 1.645)
     return s if s > 1e-12 else max(float(np.std(x)), 1e-6)
 
 
