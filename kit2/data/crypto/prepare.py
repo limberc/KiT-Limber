@@ -72,6 +72,8 @@ class ChainTables:
         self.activity = {m: pd.read_parquet(raw / "activity" / f"{m}.parquet")[["pool", "n_swaps"]]
                          for m in self.swap_months if (raw / "activity" / f"{m}.parquet").is_file()}
         self.nonstable = {a: t for a, t in q.items() if not t.stable}
+        # pool address -> int32 code: a 42-char string per swap is most of the memory of a large token
+        self.pool_code = {a: i for i, a in enumerate(self.pools.index)}
 
     def tokens(self) -> List[str]:
         return sorted(set(self.cand["base"]))
@@ -151,8 +153,18 @@ def token_bars(raw: Path, tmp: Path, chain: str, base: str, scales) -> Dict[str,
     cover = sorted(m for m in files if m in primary)
     if not cover:
         return {}
-    sw = pd.concat([pd.read_parquet(files[m]) for m in cover], ignore_index=True)
+    code = ct.pool_code
+    parts = []
+    for m in cover:
+        df = pd.read_parquet(files[m])
+        df["pool"] = df["pool"].map(code).astype(np.int32)
+        parts.append(df)
+    sw = pd.concat(parts, ignore_index=True)
+    del parts
     pools = ct.pools.loc[tok_pools, ["quote_is_token0", "quote_kind", "quote_dec"]].reset_index()
+    pools["pool"] = pools["pool"].map(code).astype(np.int32)
+    pools["quote_kind"] = pools["quote_kind"].astype("category")
+    primary = {m: code[p] for m, p in primary.items()}
     asof = pd.Timestamp(max((raw / "swaps" / f"{m}.parquet").stat().st_mtime for m in cover), unit="s")
     bars = build_token_bars_multi(sw, pools, primary, scales, cover, refs, asof=asof)
     return {s: b for s, b in bars.items() if len(b) >= 2}
@@ -213,7 +225,7 @@ def main() -> None:
     heavy = sorted([j for j in jobs if size[j[4]] > 256 * 2**20], key=lambda j: -size[j[4]])
     light = sorted([j for j in jobs if size[j[4]] <= 256 * 2**20], key=lambda j: j[2])  # chain tables cached per chain
     t0, counts, done = time.time(), {s: 0 for s in scales}, 0
-    for group, workers in ((heavy, 2), (light, args.workers)):  # heavy tokens need tens of GB each
+    for group, workers in ((heavy, 1), (light, args.workers)):  # a heavy token needs tens of GB
         with ProcessPoolExecutor(workers) as ex:
             for res in ex.map(build_token, group):
                 done += 1
