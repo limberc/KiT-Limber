@@ -26,7 +26,7 @@ import pandas as pd
 from kit2.data.features import candle_features
 from kit2.data.store import calendar_features, finalize_store
 from kit2.env import data_root
-from .bars import AUX_COLS, build_token_bars, primary_pools, reference_series
+from .bars import AUX_COLS, build_token_bars_multi, primary_pools, reference_series
 from .download import LOOKAHEAD_MONTHS, orient
 from .hypersync_dex import CHAINS
 
@@ -154,12 +154,8 @@ def token_bars(raw: Path, tmp: Path, chain: str, base: str, scales) -> Dict[str,
     sw = pd.concat([pd.read_parquet(files[m]) for m in cover], ignore_index=True)
     pools = ct.pools.loc[tok_pools, ["quote_is_token0", "quote_kind", "quote_dec"]].reset_index()
     asof = pd.Timestamp(max((raw / "swaps" / f"{m}.parquet").stat().st_mtime for m in cover), unit="s")
-    out = {}
-    for s in scales:
-        bars = build_token_bars(sw, pools, primary, s, cover, refs, asof=asof)
-        if len(bars) >= 2:
-            out[s] = bars
-    return out
+    bars = build_token_bars_multi(sw, pools, primary, scales, cover, refs, asof=asof)
+    return {s: b for s, b in bars.items() if len(b) >= 2}
 
 
 def build_token(job) -> Dict[str, int]:
@@ -213,14 +209,18 @@ def main() -> None:
     store.mkdir(parents=True, exist_ok=True)
     jobs = [(raw_root / r.chain_name, split_dir, r.chain_name, r.base, r.idx, store_tmp, scales)
             for r in inst.itertuples()]
-    jobs.sort(key=lambda j: j[2])  # a worker's chain tables are cached per chain
-    t0, counts = time.time(), {s: 0 for s in scales}
-    with ProcessPoolExecutor(args.workers) as ex:
-        for i, res in enumerate(ex.map(build_token, jobs), 1):
-            for s, n in res.items():
-                counts[s] += n
-            if i % 50 == 0 or i == len(jobs):
-                log(f"built {i}/{len(jobs)} tokens, {time.time() - t0:.0f}s, bars {counts}")
+    size = {j[4]: sum(f.stat().st_size for f in (split_dir / j[2] / j[3]).glob("*.parquet")) for j in jobs}
+    heavy = sorted([j for j in jobs if size[j[4]] > 256 * 2**20], key=lambda j: -size[j[4]])
+    light = sorted([j for j in jobs if size[j[4]] <= 256 * 2**20], key=lambda j: j[2])  # chain tables cached per chain
+    t0, counts, done = time.time(), {s: 0 for s in scales}, 0
+    for group, workers in ((heavy, 2), (light, args.workers)):  # heavy tokens need tens of GB each
+        with ProcessPoolExecutor(workers) as ex:
+            for res in ex.map(build_token, group):
+                done += 1
+                for s, n in res.items():
+                    counts[s] += n
+                if done % 50 == 0 or done == len(jobs) or group is heavy:
+                    log(f"built {done}/{len(jobs)} tokens, {time.time() - t0:.0f}s, bars {counts}")
 
     built = {int(f.stem) for f in (store_tmp / scales[0]).glob("*.npz")}
     inst[["idx", "key", "vocab", "market", "chain", "anchor"]].to_parquet(store / "instruments.parquet")
