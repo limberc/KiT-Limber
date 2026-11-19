@@ -258,3 +258,17 @@ def test_crypto_coverage_gap_starts_a_new_segment(crypto):
     bars = build_token_bars(tok, pools, {jan_mar[0]: "usdc_x"}, "1h", jan_mar,
                             {"eth": reference_series(ref, quote_is_token0=True, base_dec=18, quote_dec=6)})
     assert bars["ts"].max() <= pd.Timestamp("2025-02-01")           # no stale flat bars invented for March
+
+
+def test_no_bars_after_asof(raw, crypto):
+    """The running month is covered, but bars after the data snapshot must not be invented."""
+    asof = pd.Timestamp("2024-06-12 16:00")                         # mid-session, UTC
+    bars = build_intraday(raw, "5m", MONTHS, SPLITS, DIVS, asof=asof)
+    assert bars["ts"].max() <= asof and bars["ts"].max() > asof - pd.Timedelta(minutes=5)
+    full = build_intraday(raw, "5m", MONTHS, SPLITS, DIVS)
+    pd.testing.assert_frame_equal(bars, _upto(full, asof), check_exact=True)
+    tok, ref, pools = crypto
+    c_asof = pd.Timestamp("2025-02-10 12:00")
+    cb = build_token_bars(tok, pools, {CRYPTO_MONTHS[0]: "usdc_x", CRYPTO_MONTHS[1]: "weth_x"}, "1h", CRYPTO_MONTHS,
+                          {"eth": reference_series(ref, quote_is_token0=True, base_dec=18, quote_dec=6)}, asof=c_asof)
+    assert cb["ts"].max() == c_asof
