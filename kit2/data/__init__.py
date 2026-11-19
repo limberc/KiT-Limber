@@ -19,5 +19,6 @@ def __getattr__(name: str):
         from .us.download import USDownloader
         return USDownloader
     if name == "MarketStore":
+        from .store import MarketStore
         return MarketStore
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

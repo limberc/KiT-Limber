@@ -22,8 +22,10 @@ from typing import Dict, List
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
 from kit2.data.features import candle_features
+from kit2.data.bars_core import segments
 from kit2.data.store import calendar_features, finalize_store
 from kit2.env import data_root
 from .bars import AUX_COLS, build_token_bars_multi, primary_pools, reference_series
@@ -35,6 +37,7 @@ STEP_S = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "2h": 7200, 
 CHAIN_ID = {"eth": 1, "base": 2, "arbitrum": 3}
 VOCAB_OFFSET = 4000  # crypto instrument ids follow the US ones in the shared embedding table
 HALF_LIFE_DAYS = 5.0
+CHUNK_ROWS = 12_000_000           # swaps per build chunk: the container has a 31 GB memory limit
 KEEP = ["block", "log_index", "ts", "pool", "amount0", "amount1", "log_price", "liquidity", "tx_from", "base_fee_gwei"]
 
 
@@ -154,20 +157,42 @@ def token_bars(raw: Path, tmp: Path, chain: str, base: str, scales) -> Dict[str,
     if not cover:
         return {}
     code = ct.pool_code
-    parts = []
-    for m in cover:
-        df = pd.read_parquet(files[m])
-        df["pool"] = df["pool"].map(code).astype(np.int32)
-        parts.append(df)
-    sw = pd.concat(parts, ignore_index=True)
-    del parts
     pools = ct.pools.loc[tok_pools, ["quote_is_token0", "quote_kind", "quote_dec"]].reset_index()
     pools["pool"] = pools["pool"].map(code).astype(np.int32)
     pools["quote_kind"] = pools["quote_kind"].astype("category")
     primary = {m: code[p] for m, p in primary.items()}
     asof = pd.Timestamp(max((raw / "swaps" / f"{m}.parquet").stat().st_mtime for m in cover), unit="s")
-    bars = build_token_bars_multi(sw, pools, primary, scales, cover, refs, asof=asof)
-    return {s: b for s, b in bars.items() if len(b) >= 2}
+    rows = {m: pq.ParquetFile(files[m]).metadata.num_rows for m in cover}
+    chunks, cur, n = [], [], 0                          # whole months, at most ~CHUNK_ROWS swaps per chunk
+    for m in cover:
+        if cur and n + rows[m] > CHUNK_ROWS:
+            chunks.append(cur)
+            cur, n = [], 0
+        cur.append(m)
+        n += rows[m]
+    chunks.append(cur)
+    out: Dict[str, List[pd.DataFrame]] = {s: [] for s in scales}
+    for ch in chunks:
+        parts = []
+        for m in ch:
+            df = pd.read_parquet(files[m])
+            df["pool"] = df["pool"].map(code).astype(np.int32)
+            parts.append(df)
+        sw = pd.concat(parts, ignore_index=True)
+        del parts
+        for s, b in build_token_bars_multi(sw, pools, primary, scales, ch, refs, asof=asof).items():
+            out[s].append(b)
+        del sw
+    res = {}
+    for s, bs in out.items():
+        b = pd.concat(bs, ignore_index=True)
+        if len(b) < 2:
+            continue
+        # chunks start segments at 0: recompute from month continuity, as one build would
+        month = pd.to_datetime(b["ts"] - pd.Timedelta(1, "ns")).dt.to_period("M").astype("int64").to_numpy()
+        b["seg"] = segments(month)
+        res[s] = b
+    return res
 
 
 def build_token(job) -> Dict[str, int]:
@@ -184,7 +209,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--chains", default="eth,base,arbitrum")
     ap.add_argument("--scales", default=",".join(SCALES))
-    ap.add_argument("--workers", type=int, default=10)
+    ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--root", type=Path, default=data_root())
     ap.add_argument("--stats-sample", type=int, default=300_000)
     ap.add_argument("--skip-split", action="store_true", help="reuse tmp/ split files from a previous run")
@@ -225,7 +250,7 @@ def main() -> None:
     heavy = sorted([j for j in jobs if size[j[4]] > 256 * 2**20], key=lambda j: -size[j[4]])
     light = sorted([j for j in jobs if size[j[4]] <= 256 * 2**20], key=lambda j: j[2])  # chain tables cached per chain
     t0, counts, done = time.time(), {s: 0 for s in scales}, 0
-    for group, workers in ((heavy, 1), (light, args.workers)):  # a heavy token needs tens of GB
+    for group, workers in ((heavy, 1), (light, args.workers)):  # heavy tokens alone (memory)
         with ProcessPoolExecutor(workers) as ex:
             for res in ex.map(build_token, group):
                 done += 1
