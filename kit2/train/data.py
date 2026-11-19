@@ -42,23 +42,23 @@ class GroupSampler:
         self._ends = [self._valid_ends(b) for b in buckets]
 
     def _anchor_idx(self, market: str) -> np.ndarray:
+        """Market anchors put first in every group (store column `anchor`; US fallback: SPY, QQQ)."""
         inst = self.stores[market].instruments
-        return inst.loc[inst["key"].isin(ALWAYS.get(market, ())), "idx"].to_numpy(np.int64)
+        mask = inst["anchor"].to_numpy(bool) if "anchor" in inst else inst["key"].isin(ALWAYS.get(market, ())).to_numpy()
+        return inst.loc[mask, "idx"].to_numpy(np.int64)
 
     def _valid_ends(self, bk: Bucket) -> np.ndarray:
-        """Target-scale grid indices e allowed as window ends: all scales have enough history, and every bar
-        that can be a target lies inside the split's time range."""
+        """Target-scale grid indices e allowed as window ends: every scale has its history, the window ends
+        inside the split (grid[e] <= split end) and the latest anchor's targets start after the split start."""
         st = self.stores[bk.market]
         if bk.scale not in st.scales:
             return np.zeros(0, dtype=np.int64)
         grid = st.scales[bk.scale].grid
         P, L = 8, bk.n_patches[0] * 8
-        lo_a, _ = bk.anchor_range
         e = np.arange(L - 1, len(grid))
-        first_target = e - L + 1 + (lo_a + 1) * P
         ok = np.ones(len(e), dtype=bool)
         if self.lo_ns is not None:
-            ok &= grid[first_target] > self.lo_ns
+            ok &= grid[e - bk.horizon * P + 1] > self.lo_ns
         if self.hi_ns is not None:
             ok &= grid[e] <= self.hi_ns
         for s, n in zip(bk.scales[1:], bk.n_patches[1:]):  # coarse history must exist on its grid
@@ -68,53 +68,76 @@ class GroupSampler:
             ok &= np.searchsorted(gc, grid[e], side="right") - 1 >= n * P - 1
         return e[ok]
 
-    def sample(self, k: int, rng: np.random.Generator) -> Optional[Dict[str, np.ndarray]]:
-        bk, B, G, P = self.buckets[k], self.B[k], self.G, 8
-        ends = self._ends[k]
-        if len(ends) == 0:
-            return None
+    def _anchors(self, bk: Bucket, e: int, rng: np.random.Generator) -> np.ndarray:
+        """A anchor patches whose targets all lie inside the split (with replacement if fewer exist)."""
+        grid, P, h = self.stores[bk.market].scales[bk.scale].grid, 8, bk.horizon
+        lo, hi = bk.anchor_range
+        p = np.arange(lo, hi + 1)
+        w0 = e - bk.n_patches[0] * P + 1
+        ok = np.ones(len(p), dtype=bool)
+        if self.lo_ns is not None:
+            ok &= grid[w0 + (p + 1) * P] > self.lo_ns
+        if self.hi_ns is not None:
+            ok &= grid[w0 + (p + 1 + h) * P - 1] <= self.hi_ns
+        p = p[ok]
+        return np.sort(rng.choice(p, size=self.A, replace=len(p) < self.A))
+
+    def build(self, k: int, ends: np.ndarray, cands: List[np.ndarray], anchors: np.ndarray) -> Dict[str, np.ndarray]:
+        """Batch for window ends [B] (target grid index), candidate instruments per sample (in order; the first G
+        covered at every scale are used) and anchor patches [B, A]."""
+        bk, G, P = self.buckets[k], self.G, 8
         st = self.stores[bk.market]
         tgt = st.scales[bk.scale]
-        Ls = [n * P for n in bk.n_patches]
+        B, Ls = len(ends), [n * P for n in bk.n_patches]
         xs = [np.zeros((B, G, Lb, len(CHANNELS)), dtype=np.float16) for Lb in Ls]
         starts = [np.zeros(B, dtype=np.int64) for _ in Ls]
         inst = np.zeros((B, G), dtype=np.int64)
         valid = np.zeros((B, G), dtype=bool)
-        for i in range(B):
-            for _ in range(8):  # retry moments with no covered instrument
-                e = int(ends[rng.integers(len(ends))])
-                act = st.active_at(int(tgt.grid[e]))
-                if act is not None and len(act):
-                    break
-            else:
-                continue
-            gs = [e - Ls[0] + 1]
+        for i, (e, cand) in enumerate(zip(ends, cands)):
+            gs = [int(e) - Ls[0] + 1]
             for s, Lb in zip(bk.scales[1:], Ls[1:]):
-                gc = st.scales[s].grid
-                gs.append(int(np.searchsorted(gc, tgt.grid[e], side="right")) - Lb)
+                gs.append(int(np.searchsorted(st.scales[s].grid, tgt.grid[e], side="right")) - Lb)
             for j, g in enumerate(gs):
                 starts[j][i] = g
-            anchors = self.always[bk.market]
-            cand = np.concatenate([anchors, rng.permutation(np.setdiff1d(act, anchors))])[: 4 * G]
-            offs = []
-            for s, g, Lb in zip(bk.scales, gs, Ls):
-                offs.append(st.scales[s].locate(cand, np.full(len(cand), g), Lb))
-            ok = np.all(np.stack(offs) >= 0, axis=0)
-            take = np.flatnonzero(ok)[:G]
+            if len(cand) == 0:
+                continue
+            offs = np.stack([st.scales[s].locate(cand, np.full(len(cand), g), Lb)
+                             for s, g, Lb in zip(bk.scales, gs, Ls)])
+            take = np.flatnonzero(np.all(offs >= 0, axis=0))[:G]
             for slot, c in enumerate(take):
                 for j, s in enumerate(bk.scales):
-                    o = int(offs[j][c])
+                    o = int(offs[j, c])
                     xs[j][i, slot] = st.scales[s].X[o: o + Ls[j]]
                 inst[i, slot] = cand[c]
                 valid[i, slot] = True
-        lo, hi = bk.anchor_range
-        anchors = np.sort(np.stack([rng.choice(np.arange(lo, hi + 1), size=self.A, replace=False) for _ in range(B)]), 1)
         meta = st.instruments.set_index("idx").loc[inst.reshape(-1)]
         return {"bucket": np.int64(k), **{f"x{j}": x for j, x in enumerate(xs)},
-                **{f"start{j}": s for j, s in enumerate(starts)}, "anchors": anchors,
+                **{f"start{j}": s for j, s in enumerate(starts)}, "anchors": anchors.astype(np.int64),
                 "inst": meta["vocab"].to_numpy(np.int64).reshape(B, G) * valid,
                 "market": np.full((B, G), MARKET_ID[bk.market], dtype=np.int64),
-                "chain": meta["chain"].to_numpy(np.int64).reshape(B, G) * valid, "valid": valid}
+                "chain": meta["chain"].to_numpy(np.int64).reshape(B, G) * valid, "valid": valid,
+                "inst_idx": np.where(valid, inst, -1)}
+
+    def sample(self, k: int, rng: np.random.Generator) -> Optional[Dict[str, np.ndarray]]:
+        bk, B, G = self.buckets[k], self.B[k], self.G
+        ends_ok = self._ends[k]
+        if len(ends_ok) == 0:
+            return None
+        st = self.stores[bk.market]
+        grid = st.scales[bk.scale].grid
+        ends, cands = [], []
+        for _ in range(B):
+            for _ in range(8):  # retry moments with no instrument in the sampling set
+                e = int(ends_ok[rng.integers(len(ends_ok))])
+                act = st.active_at(int(grid[e]))
+                if act is not None and len(act):
+                    break
+            ends.append(e)
+            a = self.always[bk.market]
+            cands.append(np.concatenate([a, rng.permutation(np.setdiff1d(act, a))])[: 4 * G]
+                         if act is not None else np.zeros(0, dtype=np.int64))
+        anchors = np.stack([self._anchors(bk, e, rng) for e in ends])
+        return self.build(k, np.asarray(ends), cands, anchors)
 
 
 class _Stream(IterableDataset):
