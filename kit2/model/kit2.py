@@ -44,7 +44,7 @@ class KiT2(nn.Module):
         self.target_scale_emb = nn.Embedding(cfg.n_scales, d)
         self.rotary = RotaryAt(cfg)
         self.enc = nn.ModuleList([EncoderLayer(cfg) for _ in range(cfg.enc_layers)])
-        self.enc_norm = LlamaRMSNorm(d, eps=1e-6)
+        self.enc_norm = LlamaRMSNorm(d)
         # denoiser
         self.fut_in = nn.Linear(P * cfg.out_channels, d)
         self.fut_cal = nn.Linear(cfg.cal_dim, d)

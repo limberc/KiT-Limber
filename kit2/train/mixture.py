@@ -165,7 +165,8 @@ class AdaptiveMixture(L.Callback):
         self._counts = torch.tensor(self.mix.drawn, dtype=torch.float64, device=pl_module.device)
         self._one = torch.ones(1, dtype=torch.float64, device=pl_module.device)
 
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx) -> None:
+    def on_train_batch_end(self, trainer, pl_module, outputs,
+                           batch, batch_idx) -> None:
         self._counts.index_add_(0, batch["bucket"].reshape(1).long(), self._one)
 
     def on_validation_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:

@@ -20,8 +20,8 @@ from einops import rearrange
 from kit2.data.store import CAL_FIRST, denormalise
 from kit2.env import data_root
 from kit2.eval import EVAL_SCALES, OUT
-from kit2.train.buckets import Bucket
-from kit2.train.data import GroupSampler, to_model_batch
+from kit2.train import Bucket, GroupSampler
+from kit2.train.data import to_model_batch
 from kit2.train.lit import KiT2Lit
 
 
@@ -61,7 +61,7 @@ def main() -> None:
     for mi, mo in enumerate(plan["moments"]):
         k = EVAL_SCALES.index(mo["scale"])
         bk = buckets[k]
-        p_anchor = bk.n_patches[0] - bk.horizon - 1                   # the window's latest anchor = the moment
+        p_anchor = bk.n_patches[0] - bk.horizon - 1  # the window's latest anchor = the moment
         raw = gs.build(k, np.full(len(groups), mo["end"]), groups, np.full((len(groups), 1), p_anchor))
         batch = {key: torch.as_tensor(v).cuda() for key, v in raw.items()}
         b = to_model_batch(batch, bk, gpu_tables, lit.cfg)
@@ -69,15 +69,15 @@ def main() -> None:
         with torch.autocast("cuda", dtype=torch.bfloat16):
             z = model.sample({k_: v for k_, v in b.items() if k_ not in ("x0", "fut_ts")}, n_paths=args.paths,
                              steps=args.steps, solver="heun", generator=gen)
-        z = rearrange(z[:, 0].float(), "b k g h (p c) -> b g k (h p) c", p=8).cpu().numpy()   # normalised
+        z = rearrange(z[:, 0].float(), "b k g h (p c) -> b g k (h p) c", p=8).cpu().numpy()  # normalised
         grid_idx = mo["t_idx"] + 1 + np.arange(z.shape[3])
         first = st.scales[bk.scale].cal[grid_idx, CAL_FIRST] > 0.5
-        feat = denormalise(z, st.stats["scales"][bk.scale], first)                               # [B, G, K, n, 5]
+        feat = denormalise(z, st.stats["scales"][bk.scale], first)  # [B, G, K, n, 5]
         ret = feat[..., 0] + feat[..., 1]
         inst = raw["inst_idx"]
         keep = np.isin(inst, panel)
         res[f"{mi}_inst"] = inst[keep]
-        res[f"{mi}_ret"] = ret[keep][..., : mo["lh"]].astype(np.float32)                         # [N, K, lh]
+        res[f"{mi}_ret"] = ret[keep][..., : mo["lh"]].astype(np.float32)  # [N, K, lh]
         el = time.time() - t0
         print(f"[{mi + 1}/{len(plan['moments'])}] {mo['scale']} {mo['t']} n={int(keep.sum())} {el:.0f}s", flush=True)
     out = OUT / "pred"
