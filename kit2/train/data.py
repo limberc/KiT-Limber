@@ -12,10 +12,11 @@ earlier periods, which is the past for every split.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import lightning as L
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
@@ -150,9 +151,24 @@ class GroupSampler:
         return self.build(k, np.asarray(ends), cands, anchors)
 
 
+def train_bars(root: Path, bk: Bucket) -> int:
+    """Bars of the bucket's target scale (all instruments) that close on or before TRAIN_END."""
+    d = root / "store" / bk.market / bk.scale
+    if not (d / "grid.npy").is_file():
+        return 0
+    grid = np.load(d / "grid.npy")
+    r = pd.read_parquet(d / "runs.parquet", columns=["grid_start", "length"])
+    g_end = np.searchsorted(grid, TRAIN_END.value, side="right")
+    g0 = r["grid_start"].to_numpy(np.int64)
+    return int(np.clip(np.minimum(g0 + r["length"].to_numpy(np.int64), g_end) - g0, 0, None).sum())
+
+
 class _Stream(IterableDataset):
-    def __init__(self, sampler_args: dict, weights: List[float], seed: int, n_batches: Optional[int]) -> None:
-        self.args, self.w, self.seed, self.n = sampler_args, np.asarray(weights, float), seed, n_batches
+    """Training (n_batches None): endless, bucket drawn from `weights` at every batch - a shared-memory tensor
+    the main process may update while persistent workers run. Validation: n_batches, buckets in turn."""
+
+    def __init__(self, sampler_args: dict, weights: torch.Tensor, seed: int, n_batches: Optional[int]) -> None:
+        self.args, self.w, self.seed, self.n = sampler_args, weights, seed, n_batches
         self.sampler: Optional[GroupSampler] = None
 
     def __iter__(self):
@@ -161,10 +177,13 @@ class _Stream(IterableDataset):
         if self.sampler is None:
             self.sampler = GroupSampler(**self.args)  # memmaps opened inside the worker
         rng = np.random.default_rng([self.seed, wid])
-        p = self.w / self.w.sum()
         i = 0
         while self.n is None or i < self.n:
-            k = int(rng.choice(len(p), p=p)) if self.n is None else i % len(p)
+            if self.n is None:
+                p = self.w.numpy().astype(np.float64)
+                k = int(rng.choice(len(p), p=p / p.sum()))
+            else:
+                k = i % len(self.w)
             if self.n is None or i % nw == wid:
                 b = self.sampler.sample(k, rng)
                 if b is not None:
@@ -181,6 +200,21 @@ class StoreData(L.LightningDataModule):
         self.buckets = [Bucket(*b.split(":")) for b in buckets]
         self.bucket_names = [b.name for b in self.buckets]
         self._tables: Dict[tuple, tuple] = {}
+        w = torch.tensor(weights or [1.0] * len(self.buckets), dtype=torch.float64)
+        self.train_weights = (w / w.sum()).share_memory_()   # read by the training workers at every draw
+
+    def set_weights(self, p: Sequence[float]) -> None:
+        """New bucket probabilities for training; persistent workers use them from their next draw (batches
+        already prefetched, up to num_workers x prefetch_factor, keep the old mix)."""
+        self.train_weights.copy_(torch.as_tensor(np.asarray(p, dtype=np.float64)))
+
+    def bucket_sizes(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Per bucket: training bars, and target-bar uses per batch (B x G x A x horizon x P)."""
+        h = self.hparams
+        bars = np.array([train_bars(Path(h.root), b) for b in self.buckets], dtype=np.float64)
+        uses = np.array([max(1, round(h.batch_tokens / b.tokens(h.G))) * h.G * h.A * b.horizon * 8
+                         for b in self.buckets], dtype=np.float64)
+        return bars, uses
 
     def _args(self, split: str) -> dict:
         h = self.hparams
@@ -189,13 +223,14 @@ class StoreData(L.LightningDataModule):
 
     def train_dataloader(self) -> DataLoader:
         h = self.hparams
-        ds = _Stream(self._args("train"), h.weights or [1.0] * len(self.buckets), h.seed, None)
+        ds = _Stream(self._args("train"), self.train_weights, h.seed, None)
         return DataLoader(ds, batch_size=None, num_workers=h.num_workers, pin_memory=True,
                           persistent_workers=h.num_workers > 0, prefetch_factor=4 if h.num_workers else None)
 
     def val_dataloader(self) -> DataLoader:
         h = self.hparams
-        ds = _Stream(self._args("val"), [1.0] * len(self.buckets), 12345, h.val_batches_per_bucket * len(self.buckets))
+        ds = _Stream(self._args("val"), torch.ones(len(self.buckets)), 12345,
+                     h.val_batches_per_bucket * len(self.buckets))
         return DataLoader(ds, batch_size=None, num_workers=min(h.num_workers, 4), pin_memory=True)
 
     def _gpu_tables(self, market: str, scale: str, device) -> tuple:

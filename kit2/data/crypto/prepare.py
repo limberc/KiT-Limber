@@ -32,7 +32,9 @@ from .bars import AUX_COLS, build_token_bars_multi, primary_pools, reference_ser
 from .download import LOOKAHEAD_MONTHS, orient
 from .hypersync_dex import CHAINS
 
-SCALES = ("1m", "5m", "15m", "30m", "1h", "2h", "1d")
+# no 1m: on-chain 1-minute bars are ~3/4 of the crypto bars, mostly flat for thin tokens, and no crypto bucket
+# except crypto:1m reads them (aa3 has a 100 GB disk)
+SCALES = ("5m", "15m", "30m", "1h", "2h", "1d")
 STEP_S = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "2h": 7200, "1d": 86400}
 CHAIN_ID = {"eth": 1, "base": 2, "arbitrum": 3}
 VOCAB_OFFSET = 4000  # crypto instrument ids follow the US ones in the shared embedding table
@@ -199,7 +201,7 @@ def build_token(job) -> Dict[str, int]:
     raw, tmp, chain, base, idx, store_tmp, scales = job
     out = {}
     for s, bars in token_bars(raw, tmp, chain, base, scales).items():
-        np.savez(store_tmp / s / f"{idx}.npz", raw=channels(bars, s),
+        np.savez_compressed(store_tmp / s / f"{idx}.npz", raw=channels(bars, s),
                  ts=bars["ts"].to_numpy("datetime64[ns]").astype(np.int64), seg=bars["seg"].to_numpy(np.int64))
         out[s] = len(bars)
     return out

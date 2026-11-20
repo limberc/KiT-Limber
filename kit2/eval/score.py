@@ -49,7 +49,7 @@ def actual(z, scale: str, t_ns: int, lh: int):
 
 def bootstrap(hist: np.ndarray, lh: int, K: int, rng) -> np.ndarray:
     starts = rng.integers(0, len(hist) - lh, size=K)
-    return np.stack([hist[s: s + lh] for s in starts])            # [K, lh]
+    return np.stack([hist[s: s + lh] for s in starts])  # [K, lh]
 
 
 def score_market(market: str, models, K: int = 16, seed: int = 0) -> pd.DataFrame:
@@ -61,7 +61,7 @@ def score_market(market: str, models, K: int = 16, seed: int = 0) -> pd.DataFram
     for mi, mo in enumerate(plan["moments"]):
         s, lh = mo["scale"], mo["lh"]
         if not all(f"{mi}_inst" in preds[m].files for m in models):
-            continue                                              # a model has not forecast this moment yet
+            continue  # a model has not forecast this moment yet
         common = None
         for m in models:
             ids = set(preds[m][f"{mi}_inst"].tolist())
@@ -73,7 +73,7 @@ def score_market(market: str, models, K: int = 16, seed: int = 0) -> pd.DataFram
                 keep.append(i), acts.append(fut), hists.append(hist)
         if len(keep) < 10:
             continue
-        A = np.stack(acts)                                        # [N, lh]
+        A = np.stack(acts)  # [N, lh]
         y_ret, y_vol = A.sum(1), A.std(1, ddof=1)
         paths = {"bootstrap": np.stack([bootstrap(h, lh, K, rng) for h in hists])}
         for m in models:
@@ -82,14 +82,16 @@ def score_market(market: str, models, K: int = 16, seed: int = 0) -> pd.DataFram
             paths[m] = p[f"{mi}_ret"][[pos[i] for i in keep], :K, :lh].astype(np.float64)
         base_crps = crps(paths["bootstrap"].sum(2), y_ret)
         for m, P in paths.items():
-            r = P.sum(2)                                           # [N, K] horizon returns
+            r = P.sum(2)  # [N, K] horizon returns
             q10, q90 = np.quantile(r, 0.1, axis=1), np.quantile(r, 0.9, axis=1)
             c = crps(r, y_ret)
-            rows.append({"market": market, "scale": s, "moment": mo["t"], "model": m, "n": len(keep),
-                         "ret_rankic": spearman(r.mean(1), y_ret),
-                         "vol_rankic": spearman(P.std(2, ddof=1).mean(1), y_vol),
-                         "crps_skill": float(1 - c.mean() / base_crps.mean()),
-                         "cov80": float(((y_ret >= q10) & (y_ret <= q90)).mean())})
+            rows.append(
+                {"market": market, "scale": s, "moment": mo["t"], "model": m, "n": len(keep),
+                 "ret_rankic": spearman(r.mean(1), y_ret),
+                 "vol_rankic": spearman(P.std(2, ddof=1).mean(1), y_vol),
+                 "crps_skill": float(1 - c.mean() / base_crps.mean()),
+                 "cov80": float(((y_ret >= q10) & (y_ret <= q90)).mean())}
+            )
     return pd.DataFrame(rows)
 
 
