@@ -51,8 +51,13 @@ def make_plan(root: Path, market: str, n_inst: int, n_moments: int, seed: int) -
     full = pool[covered]
     panel = np.sort(rng.choice(full, size=min(n_inst, len(full)), replace=False))
     keys = st.instruments.set_index("idx").loc[panel, "key"].tolist()
-    return {"market": market, "panel": panel.tolist(), "keys": keys, "moments": moments,
-            "pool_size": int(len(pool)), "fully_covered": int(len(full)), "test_start": str(VAL_END)}
+    return {
+        "market": market, "panel": panel.tolist(),
+        "keys": keys, "moments": moments,
+        "pool_size": int(len(pool)),
+        "fully_covered": int(len(full)),
+        "test_start": str(VAL_END)
+    }
 
 
 def main() -> None:

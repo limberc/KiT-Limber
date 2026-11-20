@@ -69,11 +69,11 @@ class Mixture:
         self.upb = np.asarray(uses_per_batch, dtype=np.float64)
         self.max_reuse, self.tilt, self.smooth, self.warmup_evals = max_reuse, tilt, smooth, warmup_evals
         K = len(self.names)
-        self.drawn = np.zeros(K)                 # batches drawn per bucket so far
-        self.progress = np.zeros(K)              # smoothed validation-loss decrease per even share of batches
+        self.drawn = np.zeros(K)  # batches drawn per bucket so far
+        self.progress = np.zeros(K)  # smoothed validation-loss decrease per even share of batches
         self.last_loss = np.full(K, np.nan)
         self.last_drawn = np.zeros(K)
-        self.evals = 0                           # progress measurements so far
+        self.evals = 0  # progress measurements so far
         self.p = np.full(K, 1.0 / K)
 
     def capacity(self) -> np.ndarray:
@@ -96,7 +96,7 @@ class Mixture:
         self.drawn = np.asarray(drawn, dtype=np.float64)
         if np.isfinite(self.last_loss).any():
             got = self.drawn - self.last_drawn
-            share = got / max(got.sum(), 1.0) * len(got)                    # 1 = an even share of the interval
+            share = got / max(got.sum(), 1.0) * len(got)  # 1 = an even share of the interval
             gain = (self.last_loss - loss) / np.maximum(share, 0.1)
             ok = np.isfinite(gain)
             self.progress[ok] = (1 - self.smooth) * self.progress[ok] + self.smooth * gain[ok]
@@ -107,16 +107,22 @@ class Mixture:
         cap = self.capacity()
         p = unimax(cap, budget)
         mag = np.abs(self.progress)
-        scale = np.median(mag) if np.median(mag) > 0 else mag.mean()    # typical bucket's progress
+        scale = np.median(mag) if np.median(mag) > 0 else mag.mean()  # typical bucket's progress
         if self.evals >= self.warmup_evals and scale > 0:
             p = p * self.tilt ** np.tanh(self.progress / scale)
         self.p = capped(p, cap, budget)
         return self.p
 
     def state_dict(self) -> Dict[str, Any]:
-        return {"names": self.names, "drawn": self.drawn.tolist(), "progress": self.progress.tolist(),
-                "last_loss": self.last_loss.tolist(), "last_drawn": self.last_drawn.tolist(),
-                "evals": self.evals, "p": self.p.tolist()}
+        return {
+            "names": self.names,
+            "drawn": self.drawn.tolist(),
+            "progress": self.progress.tolist(),
+            "last_loss": self.last_loss.tolist(),
+            "last_drawn": self.last_drawn.tolist(),
+            "evals": self.evals,
+            "p": self.p.tolist()
+        }
 
     def load_state_dict(self, state: Dict[str, Any]) -> None:
         """Restores by bucket name; buckets new to this run start fresh."""
@@ -178,7 +184,8 @@ class AdaptiveMixture(L.Callback):
         self.dm.set_weights(self.mix.p)
         if trainer.logger is not None and trainer.is_global_zero:
             trainer.logger.log_metrics({**{f"mix/p_{n}": float(v) for n, v in zip(self.mix.names, self.mix.p)},
-                                        **{f"mix/reuse_{n}": float(v) for n, v in zip(self.mix.names, self.mix.reuse())}},
+                                        **{f"mix/reuse_{n}": float(v) for n, v in
+                                           zip(self.mix.names, self.mix.reuse())}},
                                        step=trainer.global_step)
         print(f"mix @{trainer.global_step}: " + self._describe(), flush=True)
 
@@ -196,6 +203,6 @@ class AdaptiveMixture(L.Callback):
         if not state_dict:
             return
         self._restored = state_dict
-        if self.mix is not None:          # setup already ran (Lightning restores callbacks after setup)
+        if self.mix is not None:  # setup already ran (Lightning restores callbacks after setup)
             self.mix.load_state_dict(state_dict)
             self.dm.set_weights(self.mix.p)

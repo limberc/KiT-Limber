@@ -171,15 +171,26 @@ def evaluate(recs: List[dict]) -> List[dict]:
     for name, keys in (("probe_trail", ("trail",)), ("probe_enc", ("enc",)), ("probe_enc+trail", ("enc", "trail"))):
         f, alpha = ridge(np.concatenate([feats(r, keys) for r in fit]), y, groups)
         m, se = score(test, lambda r, f=f, keys=keys: f(feats(r, keys)))
-        out.append({"method": name, "rankic": m, "se": se, "alpha": alpha})
+        out.append({"method": name,
+                    "rankic": m,
+                    "se": se,
+                    "alpha": alpha})
     for name, fn in (("trail_lh", lambda r: r["trail"][:, TRAIL.index(1.0)]), ("model", lambda r: r["model"])):
         m, se = score(test, fn)
-        out.append({"method": name, "rankic": m, "se": se, "alpha": np.nan})
+        out.append({"method": name,
+                    "rankic": m,
+                    "se": se,
+                    "alpha": np.nan})
     agree = np.nanmean([spearman(r["model"], r["trail"][:, TRAIL.index(1.0)]) for r in test])
-    out.append({"method": "model~trail_lh", "rankic": float(agree), "se": np.nan, "alpha": np.nan})
+    out.append({
+        "method": "model~trail_lh",
+        "rankic": float(agree),
+        "se": np.nan,
+        "alpha": np.nan})
     n_days = len({pd.Timestamp(int(r["t"])).normalize() for r in test})
     for o in out:
-        o.update({"n_fit_rows": len(y), "n_test_windows": len({int(r["win"]) for r in test}), "test_days": n_days})
+        o.update({"n_fit_rows": len(y),
+                  "n_test_windows": len({int(r["win"]) for r in test}), "test_days": n_days})
     return out
 
 
