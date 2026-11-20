@@ -6,9 +6,10 @@ unseen by the model, test untouched). For every (window, anchor, instrument):
   enc     encoder states: the anchor's target-scale token and the mean of all memory tokens visible at the anchor
   trail   log trailing vol over lh/4, lh/2, lh, 2 lh, 4 lh bars up to the anchor (hand-made history features)
   model   the model's own forecast: mean over K sampled paths of each path's per-bar return std (as kit2.eval.score)
-Ridge probes (cross-sectionally demeaned, ridge penalty by window-grouped CV) are fit on the earlier half of the
-windows and scored on the later half. Score = Spearman across instruments per (window, anchor) - the vol RankIC
-definition - averaged per window, then over windows (s.e. over windows).
+Ridge probes (on within-cross-section ranks of y and of the trailing vols, demeaned encoder states; penalty by
+window-grouped CV) are fit on the earlier half of the windows and scored on the later half. Score = Spearman across
+instruments per (window, anchor) - the vol RankIC definition - averaged per window, then over windows (s.e. over
+windows).
 
 Reading: probe(enc) >= trailing vol while the model's sampled vol is far below -> the encoder has the signal and
 the generator loses it; probe(enc) well below trailing vol -> the encoder discards it.
@@ -30,15 +31,15 @@ from einops import rearrange
 from kit2.data.store import CAL_FIRST, denormalise
 from kit2.env import data_root
 from kit2.eval import EVAL_SCALES, KIT_LH, OUT
-from kit2.eval.score import spearman
+from kit2.train import KiT2Lit
 from kit2.train.batch import model_inputs
 from kit2.train.buckets import Bucket
 from kit2.train.data import GroupSampler, to_model_batch
-from kit2.train.lit import KiT2Lit
+from .score import spearman
 
 P = 8
 G = 32
-TRAIL = (0.25, 0.5, 1.0, 2.0, 4.0)       # trailing windows in multiples of lh
+TRAIL = (0.25, 0.5, 1.0, 2.0, 4.0)  # trailing windows in multiples of lh
 
 
 def log_vol(y: np.ndarray, stats: dict, first: np.ndarray) -> np.ndarray:
@@ -73,33 +74,33 @@ def collect(model, cfg, root: Path, bk: Bucket, n_windows: int, chunk: int, path
         batch = {k: torch.as_tensor(v).cuda() for k, v in raw.items()}
         b = to_model_batch(batch, bk, gpu_tables, cfg)
         inp = model_inputs(b)
-        anchors = raw["anchors"]                                                          # [B, A]
+        anchors = raw["anchors"]  # [B, A]
         B, A = anchors.shape
         bi = torch.arange(B, device="cuda")[:, None]
         at = torch.as_tensor(anchors, device="cuda")
         assert bool((b["tok_close"][bi, at] == b["anchor_close"]).all()), "anchor token is not the target patch"
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            hmem = model.encode(inp)["h"].float()                                         # [B, G, S, d]
+            hmem = model.encode(inp)["h"].float()  # [B, G, S, d]
             z = model.sample(inp, n_paths=paths, steps=steps, solver="heun", generator=gen)
-        tok = hmem[bi, :, at]                                                             # [B, A, G, d] anchor token
-        vis = (b["tok_close"][:, None, :] <= b["anchor_close"][:, :, None]).float()       # [B, A, S]
+        tok = hmem[bi, :, at]  # [B, A, G, d] anchor token
+        vis = (b["tok_close"][:, None, :] <= b["anchor_close"][:, :, None]).float()  # [B, A, S]
         vis = vis / vis.sum(-1, keepdim=True)
         mean = torch.einsum("bas,bgsd->bagd", vis, hmem)
-        enc = torch.cat([tok, mean], -1).cpu().numpy()                                    # [B, A, G, 2d]
+        enc = torch.cat([tok, mean], -1).cpu().numpy()  # [B, A, G, 2d]
         x0 = rearrange(b["x0"].float(), "b a g h (p c) -> b a g (h p) c", p=P).cpu().numpy()
         zz = rearrange(z.float(), "b a k g h (p c) -> b a k g (h p) c", p=P).cpu().numpy()
         t_anchor = b["anchor_close"].cpu().numpy()
-        hist, start = raw["x0"], raw["start0"]                                            # target-scale window
+        hist, start = raw["x0"], raw["start0"]  # target-scale window
         for i in range(B):
             ok = raw["valid"][i]
             for a in range(A):
                 fut = start[i] + (anchors[i, a] + 1) * P + np.arange(h * P)
                 first_f = cal[fut[:lh], CAL_FIRST] > 0.5
-                end = (anchors[i, a] + 1) * P                                             # bars [.., end) are history
+                end = (anchors[i, a] + 1) * P  # bars [.., end) are history
                 w_max = int(TRAIL[-1] * lh)
                 first_h = cal[start[i] + np.arange(end - w_max, end), CAL_FIRST] > 0.5
                 f = denormalise(hist[i, :, end - w_max: end].astype(np.float64), stats, first_h)
-                r = f[..., 0] + f[..., 1]                                                 # [G, w_max]
+                r = f[..., 0] + f[..., 1]  # [G, w_max]
                 trail = np.stack([np.log(np.maximum(r[:, -max(2, int(m * lh)):].std(-1, ddof=1), 1e-12))
                                   for m in TRAIL], -1)
                 recs.append({
@@ -142,22 +143,29 @@ def score(recs: List[dict], pred: Callable[[dict], np.ndarray]) -> Tuple[float, 
     return float(per.mean()), float(per.std(ddof=1) / np.sqrt(len(per)))
 
 
+def cs_rank(x: np.ndarray) -> np.ndarray:
+    """Ranks within one cross-section (columns separately, ties averaged), scaled to [-1, 1]. Flat-priced
+    instruments have zero realised vol (log vol -27), which would dominate a squared-error fit."""
+    r = pd.DataFrame(x).rank().to_numpy()
+    return (2 * (r - 1) / max(len(x) - 1, 1) - 1).reshape(x.shape)
+
+
+def feats(r: dict, keys) -> np.ndarray:
+    """Probe inputs of one cross-section: trailing vols as ranks, encoder states demeaned."""
+    return np.concatenate([cs_rank(r[k]) if k == "trail" else r[k] - r[k].mean(0, keepdims=True) for k in keys], 1)
+
+
 def evaluate(recs: List[dict]) -> List[dict]:
     t_win = pd.Series({int(r["win"]): int(r["t"]) for r in recs})
     split = t_win.median()
     fit = [r for r in recs if t_win[int(r["win"])] <= split]
     test = [r for r in recs if t_win[int(r["win"])] > split]
-
-    def stack(rs, key):
-        return np.concatenate([r[key] - r[key].mean(0, keepdims=True) for r in rs])
-
     groups = np.concatenate([np.full(len(r["y"]), int(r["win"])) for r in fit])
-    y = stack(fit, "y")
+    y = np.concatenate([cs_rank(r["y"]) for r in fit])
     out = []
     for name, keys in (("probe_trail", ("trail",)), ("probe_enc", ("enc",)), ("probe_enc+trail", ("enc", "trail"))):
-        X = np.concatenate([stack(fit, k) for k in keys], 1)
-        f, alpha = ridge(X, y, groups)
-        m, se = score(test, lambda r, f=f, keys=keys: f(np.concatenate([r[k] for k in keys], 1)))
+        f, alpha = ridge(np.concatenate([feats(r, keys) for r in fit]), y, groups)
+        m, se = score(test, lambda r, f=f, keys=keys: f(feats(r, keys)))
         out.append({"method": name, "rankic": m, "se": se, "alpha": alpha})
     for name, fn in (("trail_lh", lambda r: r["trail"][:, TRAIL.index(1.0)]), ("model", lambda r: r["model"])):
         m, se = score(test, fn)
