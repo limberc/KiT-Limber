@@ -31,10 +31,9 @@ from einops import rearrange
 from kit2.data.store import CAL_FIRST, denormalise
 from kit2.env import data_root
 from kit2.eval import EVAL_SCALES, KIT_LH, OUT
-from kit2.train import KiT2Lit
+from kit2.train import KiT2Lit, GroupSampler, Bucket
 from kit2.train.batch import model_inputs
-from kit2.train.buckets import Bucket
-from kit2.train.data import GroupSampler, to_model_batch
+from kit2.train.data import to_model_batch
 from .score import spearman
 
 P = 8
