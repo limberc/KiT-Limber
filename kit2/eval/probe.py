@@ -18,23 +18,29 @@ Usage: python -m kit2.eval.probe --ckpt <path> [--tag 20k --windows 128 --paths 
 """
 from __future__ import annotations
 
-import argparse
-import time
-from pathlib import Path
-from typing import Callable, Dict, List, Tuple
+import os
 
-import numpy as np
-import pandas as pd
-import torch
-from einops import rearrange
+# aa3's cgroup allows ~10 CPUs but shows 48: OpenBLAS's default 48 threads made one 1024 x 1024 SVD take 76 s (0.5 s
+# with 8). Must be set before numpy loads OpenBLAS.
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "8")
 
-from kit2.data.store import CAL_FIRST, denormalise
-from kit2.env import data_root
-from kit2.eval import EVAL_SCALES, KIT_LH, OUT
-from kit2.train import KiT2Lit, GroupSampler, Bucket
-from kit2.train.batch import model_inputs
-from kit2.train.data import to_model_batch
-from .score import spearman
+import argparse  # noqa: E402
+import time  # noqa: E402
+from pathlib import Path  # noqa: E402
+from typing import Callable, Dict, List, Tuple  # noqa: E402
+
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+import torch  # noqa: E402
+from einops import rearrange  # noqa: E402
+
+from kit2.data.store import CAL_FIRST, denormalise  # noqa: E402
+from kit2.env import data_root  # noqa: E402
+from kit2.eval import EVAL_SCALES, KIT_LH, OUT  # noqa: E402
+from kit2.train import KiT2Lit, GroupSampler, Bucket  # noqa: E402
+from kit2.train.batch import model_inputs  # noqa: E402
+from kit2.train.data import to_model_batch  # noqa: E402
+from .score import spearman  # noqa: E402
 
 P = 8
 G = 32
