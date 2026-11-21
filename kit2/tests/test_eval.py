@@ -37,3 +37,15 @@ def test_panel_name_that_is_a_market_anchor_is_not_duplicated(root):  # noqa: F8
     raw = gs.build(0, np.full(len(groups), e), groups, np.full((len(groups), 1), bk.anchor_range[1]))
     for row, ok in zip(raw["inst_idx"], raw["valid"]):
         assert ok.all() and len(set(row.tolist())) == G           # full, no instrument twice in a group
+
+
+def test_lgbm_paths_carry_exact_mean_and_vol():
+    from kit2.eval.lgbm import gaussian_paths
+    from kit2.eval.score import spearman
+    rng = np.random.default_rng(0)
+    mu, sigma = rng.normal(0, 0.01, 50), np.exp(rng.normal(-6, 0.5, 50))
+    P = gaussian_paths(mu, sigma, 20, 16, rng)
+    np.testing.assert_allclose(P.sum(2).mean(1), mu, atol=1e-12)                  # score's return forecast
+    np.testing.assert_allclose(P.std(2, ddof=1), np.repeat(sigma[:, None], 16, 1))  # score's vol forecast
+    assert spearman(P.std(2, ddof=1).mean(1), sigma) == 1.0
+    np.testing.assert_allclose(P.sum(2).std(1), sigma * np.sqrt(20), rtol=0.1)     # horizon spread ~ sigma sqrt(lh)

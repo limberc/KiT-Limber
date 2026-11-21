@@ -190,7 +190,8 @@ def evaluate(recs: List[dict]) -> List[dict]:
         "method": "model~trail_lh",
         "rankic": float(agree),
         "se": np.nan,
-        "alpha": np.nan})
+        "alpha": np.nan
+    })
     n_days = len({pd.Timestamp(int(r["t"])).normalize() for r in test})
     for o in out:
         o.update({"n_fit_rows": len(y),
