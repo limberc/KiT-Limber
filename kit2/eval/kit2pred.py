@@ -27,6 +27,14 @@ from kit2.train.data import to_model_batch
 from kit2.train.lit import KiT2Lit
 
 
+def panel_chunks(panel: np.ndarray, anchors: np.ndarray, G: int, rng: np.random.Generator) -> List[np.ndarray]:
+    """Panel names in random groups of G - len(anchors). Panel names that are market anchors are left out: every group
+    already holds them (in the crypto panels such a name sat twice in a group, which training never produces)."""
+    order = rng.permutation(np.setdiff1d(panel, anchors))
+    room = G - len(anchors)
+    return [order[i: i + room] for i in range(0, len(order), room)]
+
+
 def fill_groups(chunks: List[np.ndarray], anchors: np.ndarray, panel: np.ndarray, active: np.ndarray, G: int,
                 rng: np.random.Generator) -> List[np.ndarray]:
     """Candidate list per group: market anchors, the group's panel names, then context instruments from the sampling
@@ -56,9 +64,7 @@ def main() -> None:
     anchors = gs.always[args.market]
     panel = np.array(plan["panel"], dtype=np.int64)
     rng = np.random.default_rng(args.seed)
-    order = rng.permutation(panel)
-    room = G - len(anchors)
-    chunks = [order[i: i + room] for i in range(0, len(order), room)]
+    chunks = panel_chunks(panel, anchors, G, rng)
     tables = {}
 
     def gpu_tables(m, s, dev):
@@ -88,12 +94,15 @@ def main() -> None:
         first = st.scales[bk.scale].cal[grid_idx, CAL_FIRST] > 0.5
         feat = denormalise(z, st.stats["scales"][bk.scale], first)  # [B, G, K, n, 5]
         ret = feat[..., 0] + feat[..., 1]
-        inst = raw["inst_idx"]
-        keep = np.isin(inst, panel)
+        inst = raw["inst_idx"].reshape(-1)
+        ret = ret.reshape(-1, *ret.shape[2:])
+        _, first_at = np.unique(inst, return_index=True)       # anchors in the panel: score the first group's forecast
+        keep = np.sort(first_at[np.isin(inst[first_at], panel)])
+        assert len(keep) == len(panel)
         res[f"{mi}_inst"] = inst[keep]
         res[f"{mi}_ret"] = ret[keep][..., : mo["lh"]].astype(np.float32)  # [N, K, lh]
         el = time.time() - t0
-        print(f"[{mi + 1}/{len(plan['moments'])}] {mo['scale']} {mo['t']} n={int(keep.sum())} "
+        print(f"[{mi + 1}/{len(plan['moments'])}] {mo['scale']} {mo['t']} n={len(keep)} "
               f"group sizes {raw['valid'].sum(1).min()}-{raw['valid'].sum(1).max()} {el:.0f}s", flush=True)
     out = OUT / "pred"
     out.mkdir(parents=True, exist_ok=True)
