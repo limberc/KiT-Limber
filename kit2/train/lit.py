@@ -23,7 +23,9 @@ SPLIT_ID = {"train": 0, "val": 1, "test": 2}
 
 class KiT2Lit(L.LightningModule):
     def __init__(self, model: Dict[str, Any], optim: Dict[str, Any], compile: bool = True,
-                 bucket_names: Optional[List[str]] = None) -> None:
+                 bucket_names: Optional[List[str]] = None, p_cond: float = 0.0) -> None:
+        """p_cond: share of training (sample, anchor) pairs that condition on a clean subset of instruments
+        (kit2.model.conditioning_subset); validation always uses the joint objective, comparable across runs."""
         super().__init__()
         self.save_hyperparameters()
         self.cfg = preset(model.get("preset", "dev"), **model.get("overrides", {}))
@@ -44,8 +46,9 @@ class KiT2Lit(L.LightningModule):
         if dm is not None and getattr(dm, "bucket_names", None):
             self.bucket_names = dm.bucket_names
 
-    def _loss(self, b: Dict[str, torch.Tensor], generator: Optional[torch.Generator] = None) -> torch.Tensor:
-        return flow_loss(self.model, model_inputs(b), b["x0"], b["valid"], generator=generator)
+    def _loss(self, b: Dict[str, torch.Tensor], generator: Optional[torch.Generator] = None,
+              p_cond: float = 0.0) -> torch.Tensor:
+        return flow_loss(self.model, model_inputs(b), b["x0"], b["valid"], generator=generator, p_cond=p_cond)
 
     def on_before_optimizer_step(self, optimizer) -> None:
         # clipping here, not via Trainer(gradient_clip_val): Lightning refuses that with fused AdamW
@@ -55,7 +58,7 @@ class KiT2Lit(L.LightningModule):
             self.log("train/grad_norm", norm, on_step=True, batch_size=1)
 
     def training_step(self, b: Dict[str, torch.Tensor], idx: int) -> torch.Tensor:
-        loss = self._loss(b)
+        loss = self._loss(b, p_cond=self.hparams.get("p_cond", 0.0))
         self.log("train/loss", loss, prog_bar=True, on_step=True, batch_size=1)
         return loss
 

@@ -4,6 +4,8 @@ Each moment: the panel is split into groups; each group = market anchors (contex
 instruments, filled up to G = 32 with context instruments from the moment's sampling set, so every group is full
 as in training (only panel instruments are scored). The forecast is made at the close of the moment's bar (the
 window's latest anchor patch), K paths, Heun sampler. Paths are denormalised with the store's training-period stats.
+Besides the panel paths, each moment stores the group of every panel name and the market anchors' paths per group
+(path k of one group is one joint draw), which kit2.eval.joint scores.
 
 Usage: python -m kit2.eval.kit2pred --market us --ckpt <path> [--paths 16 --steps 8]
 """
@@ -24,7 +26,7 @@ from kit2.env import data_root
 from kit2.eval import EVAL_SCALES, OUT
 from kit2.train import Bucket, GroupSampler
 from kit2.train.data import to_model_batch
-from kit2.train.lit import KiT2Lit
+from kit2.train import KiT2Lit
 
 
 def panel_chunks(panel: np.ndarray, anchors: np.ndarray, G: int, rng: np.random.Generator) -> List[np.ndarray]:
@@ -44,6 +46,19 @@ def fill_groups(chunks: List[np.ndarray], anchors: np.ndarray, panel: np.ndarray
     return [np.concatenate([anchors, c, ctx]) for c in chunks]
 
 
+def group_layout(inst: np.ndarray, panel: np.ndarray, anchors: np.ndarray):
+    """inst [n_groups, G] instrument ids of the groups sent to the model (-1 = padding) -> keep, grp, anc, anc_pos:
+    keep     flat positions of the panel names to score (a name in several groups - a market anchor - once, first group)
+    grp      group row of each kept name: path k of the names in one row is one joint draw of that group's future
+    anc      market anchors present in every group; anc_pos [n_groups, len(anc)] their position in each row."""
+    flat = inst.reshape(-1)
+    _, first_at = np.unique(flat, return_index=True)
+    keep = np.sort(first_at[np.isin(flat[first_at], panel)])
+    anc = np.array([a for a in anchors if (inst == a).any(1).all()], dtype=np.int64)
+    anc_pos = np.array([[int(np.flatnonzero(row == a)[0]) for a in anc] for row in inst], dtype=np.int64)
+    return keep, keep // inst.shape[1], anc, anc_pos.reshape(len(inst), len(anc))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--market", required=True)
@@ -53,6 +68,12 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--root", type=Path, default=data_root())
     ap.add_argument("--tag", default="kit2")
+    ap.add_argument("--condition", choices=("none", "oracle", "couple"), default="none",
+                    help="oracle: market anchors take their realised futures (scenario evaluation - uses the future, "
+                         "not a forecast); couple: every group takes group 0's sampled anchor paths, so path k is one "
+                         "joint draw of the whole panel")
+    ap.add_argument("--cond-mode", choices=("clean", "replace"), default="replace",
+                    help="clean needs a checkpoint trained with p_cond > 0; replace (inpainting) works with any")
     args = ap.parse_args()
     plan = json.loads((OUT / f"plan_{args.market}.json").read_text())
     lit = KiT2Lit.load_from_checkpoint(args.ckpt, map_location="cuda", compile=False)
@@ -86,21 +107,35 @@ def main() -> None:
         batch = {key: torch.as_tensor(v).cuda() for key, v in raw.items()}
         b = to_model_batch(batch, bk, gpu_tables, lit.cfg)
         assert int(b["anchor_close"][0, 0]) == mo["t_ns"], "anchor is not the planned moment"
+        keep, grp, anc, anc_pos = group_layout(raw["inst_idx"], panel, anchors)
+        inp = {k_: v for k_, v in b.items() if k_ not in ("x0", "fut_ts")}
+        rows = torch.arange(len(anc_pos), device="cuda")[:, None]
+        pos = torch.as_tensor(anc_pos, device="cuda")
+        mask = torch.zeros(b["valid"].shape, dtype=torch.bool, device="cuda")
+        mask[rows, pos] = True                                  # the market anchors of every group
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            z = model.sample({k_: v for k_, v in b.items() if k_ not in ("x0", "fut_ts")}, n_paths=args.paths,
-                             steps=args.steps, solver="heun", generator=gen)
+            kw = dict(n_paths=args.paths, steps=args.steps, solver="heun", generator=gen)
+            if args.condition == "none" or len(anc) == 0:
+                z = model.sample(inp, **kw)
+            elif args.condition == "oracle":
+                z = model.sample(inp, given=b["x0"], given_mask=mask, mode=args.cond_mode, **kw)
+            else:
+                z0 = model.sample(inp, **kw)                    # [B, A, K, G, h, C]
+                given = torch.zeros_like(z0)
+                given[rows, :, :, pos] = z0[0, :, :, pos[0]].unsqueeze(0).movedim(3, 1)  # group 0's anchor paths
+                z = model.sample(inp, given=given, given_mask=mask, mode=args.cond_mode, **kw)
         z = rearrange(z[:, 0].float(), "b k g h (p c) -> b g k (h p) c", p=8).cpu().numpy()  # normalised
         grid_idx = mo["t_idx"] + 1 + np.arange(z.shape[3])
         first = st.scales[bk.scale].cal[grid_idx, CAL_FIRST] > 0.5
         feat = denormalise(z, st.stats["scales"][bk.scale], first)  # [B, G, K, n, 5]
-        ret = feat[..., 0] + feat[..., 1]
-        inst = raw["inst_idx"].reshape(-1)
-        ret = ret.reshape(-1, *ret.shape[2:])
-        _, first_at = np.unique(inst, return_index=True)       # anchors in the panel: score the first group's forecast
-        keep = np.sort(first_at[np.isin(inst[first_at], panel)])
+        ret = feat[..., 0] + feat[..., 1]                       # [n_groups, G, K, n]
         assert len(keep) == len(panel)
+        inst = raw["inst_idx"].reshape(-1)
         res[f"{mi}_inst"] = inst[keep]
-        res[f"{mi}_ret"] = ret[keep][..., : mo["lh"]].astype(np.float32)  # [N, K, lh]
+        res[f"{mi}_ret"] = ret.reshape(-1, *ret.shape[2:])[keep][..., : mo["lh"]].astype(np.float32)  # [N, K, lh]
+        res[f"{mi}_grp"] = grp                                  # joint draws: same path k within one group
+        res[f"{mi}_anc_inst"] = anc
+        res[f"{mi}_anc_ret"] = ret[np.arange(len(ret))[:, None], anc_pos][..., : mo["lh"]].astype(np.float32)
         el = time.time() - t0
         print(f"[{mi + 1}/{len(plan['moments'])}] {mo['scale']} {mo['t']} n={len(keep)} "
               f"group sizes {raw['valid'].sum(1).min()}-{raw['valid'].sum(1).max()} {el:.0f}s", flush=True)

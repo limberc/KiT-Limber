@@ -52,9 +52,12 @@ def make_plan(root: Path, market: str, n_inst: int, n_moments: int, seed: int, s
     full = pool[covered]
     panel = np.sort(rng.choice(full, size=min(n_inst, len(full)), replace=False))
     keys = st.instruments.set_index("idx").loc[panel, "key"].tolist()
+    anchors = gs.always[market]                       # in every KiT-2 group; joint scoring needs their bars too
     return {
         "market": market, "panel": panel.tolist(),
         "keys": keys, "moments": moments,
+        "anchors": anchors.tolist(),
+        "anchor_keys": st.instruments.set_index("idx").loc[anchors, "key"].tolist(),
         "pool_size": int(len(pool)),
         "fully_covered": int(len(full)),
         "split": split,

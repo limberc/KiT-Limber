@@ -56,11 +56,12 @@ def main() -> None:
     ap.add_argument("--root", type=Path, default=data_root())
     args = ap.parse_args()
     plan = json.loads((OUT / f"plan_{args.market}.json").read_text())
+    want = dict(zip(plan["panel"], plan["keys"])) | dict(zip(plan.get("anchors", []), plan.get("anchor_keys", [])))
     out = OUT / "bars" / args.market
     out.mkdir(parents=True, exist_ok=True)
     fn = _us if args.market == "us" else _crypto
-    jobs = [(i, k, args.root) for i, k in zip(plan["panel"], plan["keys"]) if not (out / f"{i}.npz").is_file()]
-    print(f"{len(plan['panel']) - len(jobs)} of {len(plan['panel'])} instruments already built", flush=True)
+    jobs = [(i, k, args.root) for i, k in want.items() if not (out / f"{i}.npz").is_file()]
+    print(f"{len(want) - len(jobs)} of {len(want)} instruments (panel + market anchors) already built", flush=True)
     if args.market == "crypto" and jobs:
         from kit2.data.crypto.prepare import ensure_split
         ensure_split(args.root / "raw" / "crypto", args.root / "tmp" / "crypto_split", [k for _, k, _ in jobs])

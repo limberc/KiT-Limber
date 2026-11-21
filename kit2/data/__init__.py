@@ -6,7 +6,7 @@ if TYPE_CHECKING:  # for IDEs and type checkers; real imports are lazy (__getatt
     from .us.download import USDownloader
     from .store import MarketStore
 
-__all__ = ["CryptoDownloader", "USDownloader"]
+__all__ = ["CryptoDownloader", "USDownloader", "MarketStore"]
 
 
 def __getattr__(name: str):

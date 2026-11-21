@@ -127,6 +127,7 @@ class GroupSampler:
                 "inst": meta["vocab"].to_numpy(np.int64).reshape(B, G) * valid,
                 "market": np.full((B, G), MARKET_ID[bk.market], dtype=np.int64),
                 "chain": meta["chain"].to_numpy(np.int64).reshape(B, G) * valid, "valid": valid,
+                "is_anchor": valid & np.isin(inst, self.always[bk.market]),   # market anchors (conditioning sets)
                 "inst_idx": np.where(valid, inst, -1)}
 
     def sample(self, k: int, rng: np.random.Generator) -> Optional[Dict[str, np.ndarray]]:
@@ -256,7 +257,7 @@ def to_model_batch(batch: Dict[str, torch.Tensor], bk: Bucket, tables, cfg) -> D
         grid, cal = tables(bk.market, s, dev)
         wins.append(ScaleWindow(batch[f"x{j}"], batch[f"start{j}"], grid, cal, SCALE_ID[s]))
     B = batch["anchors"].shape[0]
-    meta = {k: batch[k] for k in ("inst", "market", "chain", "valid")}
+    meta = {k: batch[k] for k in ("inst", "market", "chain", "valid", "is_anchor") if k in batch}
     meta["target_scale"] = torch.full((B,), SCALE_ID[bk.scale], dtype=torch.long, device=dev)
     b = assemble(wins, batch["anchors"], bk.horizon, meta, cfg)
     b["bucket"] = batch["bucket"]

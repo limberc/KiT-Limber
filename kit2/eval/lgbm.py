@@ -129,7 +129,7 @@ def main() -> None:
     ap.add_argument("--tag", default="lgbm")
     args = ap.parse_args()
     plan = json.loads((OUT / f"plan_{args.market}.json").read_text())
-    panel = np.array(plan["panel"], dtype=np.int64)
+    panel = np.union1d(plan["panel"], plan.get("anchors", [])).astype(np.int64)  # anchors: the joint copula baseline
     st = MarketStore(args.root, args.market, list(EVAL_SCALES))
     rng = np.random.default_rng(args.seed)
     models: Dict[str, tuple] = {}

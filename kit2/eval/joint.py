@@ -118,6 +118,18 @@ def copula_paths(mu: np.ndarray, sigma: np.ndarray, C: np.ndarray, lh: int, K: i
 
 
 # ---- data ---------------------------------------------------------------------------------------------------------
+def load_bars(market: str, ids) -> Dict[int, Dict[str, np.ndarray]]:
+    """Bar files of the given instruments (those that exist): per scale s, s_ts and per-bar log returns s_ret."""
+    bars = {}
+    for i in ids:
+        f = OUT / "bars" / market / f"{i}.npz"
+        if f.is_file():
+            with np.load(f) as z:
+                bars[int(i)] = {k: z[k] for k in z.files if k.endswith("_ts")}
+                bars[int(i)] |= {k[:-5] + "_ret": z[k][:, 0] + z[k][:, 1] for k in z.files if k.endswith("_feat")}
+    return bars
+
+
 def window(z: Dict[str, np.ndarray], scale: str, t_ns: int, lh: int):
     """Trailing (ts, returns) up to and including the bar closing at t_ns, and the next lh (ts, returns).
     z: one bars file with per-bar log returns `<scale>_ret` added."""
@@ -130,18 +142,20 @@ def window(z: Dict[str, np.ndarray], scale: str, t_ns: int, lh: int):
     return ts[lo:i], r[lo:i], ts[i: i + lh], r[i: i + lh]
 
 
-def kit2_member_paths(p, mi: int, g: int, ids: List[int]) -> np.ndarray:
-    """[M, K, lh] of group g's members from a kit2pred file (anchors from the group's own anchor paths)."""
+def kit2_member_paths(p, mi: int, g: Optional[int], ids: List[int]) -> np.ndarray:
+    """[M, K, lh] of group g's members from a kit2pred file (anchors from the group's own anchor paths). g None: the
+    whole panel, anchors from group 0 - one joint draw per path only if the groups were coupled (--condition couple)."""
     anc = {int(a): j for j, a in enumerate(p[f"{mi}_anc_inst"])}
     inst, grp = p[f"{mi}_inst"], p[f"{mi}_grp"]
-    pos = {int(i): j for j, i in enumerate(inst) if grp[j] == g}
-    return np.stack([p[f"{mi}_anc_ret"][g, anc[i]] if i in anc else p[f"{mi}_ret"][pos[i]] for i in ids])
+    pos = {int(i): j for j, i in enumerate(inst) if g is None or grp[j] == g}
+    ga = 0 if g is None else g
+    return np.stack([p[f"{mi}_anc_ret"][ga, anc[i]] if i in anc else p[f"{mi}_ret"][pos[i]] for i in ids])
 
 
-def group_members(p, mi: int, g: int) -> List[int]:
-    """Market anchors first, then the panel names forecast in group g."""
+def group_members(p, mi: int, g: Optional[int]) -> List[int]:
+    """Market anchors first, then the panel names forecast in group g (g None: in any group)."""
     anc = [int(a) for a in p[f"{mi}_anc_inst"]]
-    names = [int(i) for i, gg in zip(p[f"{mi}_inst"], p[f"{mi}_grp"]) if gg == g and int(i) not in anc]
+    names = [int(i) for i, gg in zip(p[f"{mi}_inst"], p[f"{mi}_grp"]) if (g is None or gg == g) and int(i) not in anc]
     return anc + names
 
 
@@ -192,16 +206,10 @@ def score_group(paths: Dict[str, np.ndarray], Y: np.ndarray, Rh: np.ndarray, n_a
     return out
 
 
-def score_market(market: str, models: List[str], lgbm: Optional[str], seed: int = 0) -> pd.DataFrame:
+def score_market(market: str, models: List[str], lgbm: Optional[str], seed: int = 0,
+                 universe: bool = False) -> pd.DataFrame:
     plan = json.loads((OUT / f"plan_{market}.json").read_text())
-    want = set(plan["panel"]) | set(plan.get("anchors", []))
-    bars = {}
-    for i in want:
-        f = OUT / "bars" / market / f"{i}.npz"
-        if f.is_file():
-            with np.load(f) as z:
-                bars[i] = {k: z[k] for k in z.files if k.endswith("_ts")}
-                bars[i] |= {k[:-5] + "_ret": z[k][:, 0] + z[k][:, 1] for k in z.files if k.endswith("_feat")}
+    bars = load_bars(market, set(plan["panel"]) | set(plan.get("anchors", [])))
     preds = {m: np.load(OUT / "pred" / f"{m}_{market}.npz") for m in models}
     lg = np.load(OUT / "pred" / f"{lgbm}_{market}.npz") if lgbm else None
     rng = np.random.default_rng(seed)
@@ -220,8 +228,8 @@ def score_market(market: str, models: List[str], lgbm: Optional[str], seed: int 
             lret = lg[f"{mi}_ret"].astype(np.float64)
         else:
             lpos, lret = {}, None
-        for g in np.unique(p0[f"{mi}_grp"]):
-            ids = [i for i in group_members(p0, mi, int(g)) if i in bars and (lret is None or i in lpos)]
+        for g in ([None] if universe else [int(x) for x in np.unique(p0[f"{mi}_grp"])]):
+            ids = [i for i in group_members(p0, mi, g) if i in bars and (lret is None or i in lpos)]
             wins = {i: w for i in ids if (w := window(bars[i], s, mo["t_ns"], lh)) is not None}
             ids = list(wins)
             if len(ids) < 4:
@@ -240,7 +248,7 @@ def score_market(market: str, models: List[str], lgbm: Optional[str], seed: int 
             n_anc = sum(i in anc_set for i in ids)
             if len(ids) - n_anc < 3:
                 continue
-            paths = {m: kit2_member_paths(preds[m], mi, int(g), ids)[:, :K].astype(np.float64) for m in models}
+            paths = {m: kit2_member_paths(preds[m], mi, g, ids)[:, :K].astype(np.float64) for m in models}
             paths["indep"] = indep_paths([wins[i][1] for i in ids], lh, K, rng)
             paths["sync"] = sync_paths(Rh, lh, K, rng)
             if lret is not None:
@@ -249,8 +257,8 @@ def score_market(market: str, models: List[str], lgbm: Optional[str], seed: int 
                 paths["lgbm_cop"] = copula_paths(mu, sigma, ledoit_wolf_corr(Rh.T), lh, K, rng)
             res = score_group(paths, Y, Rh, n_anc, rng)
             for m, r in res.items():
-                rows.append({"market": market, "scale": s, "moment": mo["t"], "group": int(g), "model": m,
-                             "members": len(ids), **{k: r[k] for k in METRICS}})
+                rows.append({"market": market, "scale": s, "moment": mo["t"], "group": -1 if g is None else g,
+                             "model": m, "members": len(ids), **{k: r[k] for k in METRICS}})
     return pd.DataFrame(rows)
 
 
@@ -294,22 +302,25 @@ def main() -> None:
     ap.add_argument("--markets", default="us,crypto")
     ap.add_argument("--models", default="kit2")
     ap.add_argument("--lgbm", default="lgbm", help="LightGBM forecast tag for the copula baseline ('' to skip)")
+    ap.add_argument("--universe", action="store_true",
+                    help="score each moment's whole panel as one forecast (needs coupled groups to be joint)")
+    ap.add_argument("--out", default="joint", help="output file prefix")
     args = ap.parse_args()
     models = args.models.split(",")
-    dfs = [score_market(m, models, args.lgbm or None) for m in args.markets.split(",")
+    dfs = [score_market(m, models, args.lgbm or None, universe=args.universe) for m in args.markets.split(",")
            if (OUT / f"plan_{m}.json").is_file()]
     df = pd.concat(dfs, ignore_index=True)
-    df.to_csv(OUT / "joint_by_group.csv", index=False)
+    df.to_csv(OUT / f"{args.out}_by_group.csv", index=False)
     s = summarise(df)
-    s.to_csv(OUT / "joint_summary.csv")
+    s.to_csv(OUT / f"{args.out}_summary.csv")
     pd.set_option("display.width", 250)
     print(s.to_string())
     overall = summarise(df.assign(moment=df["scale"] + " " + df["moment"], scale="all"))
     print("\nall scales\n" + overall.to_string())
-    for b in ("lgbm_cop", "sync"):
+    for b in ("lgbm_cop", "sync", *models[1:]):
         if b in set(df["model"]):
             pr = paired(df, models[0], b)
-            pr.to_csv(OUT / f"joint_paired_{models[0]}_vs_{b}.csv", index=False)
+            pr.to_csv(OUT / f"{args.out}_paired_{models[0]}_vs_{b}.csv", index=False)
             print(f"\n{models[0]} minus {b} (same moments)\n" + pr.to_string(index=False))
 
 
