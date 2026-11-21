@@ -54,9 +54,10 @@ def test_sync_bootstrap_keeps_history_dependence_and_indep_drops_it():
 def test_copula_paths_have_the_requested_vol_and_correlation():
     rng = np.random.default_rng(3)
     C = np.array([[1.0, 0.5], [0.5, 1.0]])
-    X = copula_paths(np.array([0.02, -0.01]), np.array([0.01, 0.03]), C, 40, 512, rng)
-    assert np.allclose(X.std(2, ddof=1).mean(1), [0.01, 0.03], rtol=0.03)
-    assert np.allclose(X.sum(2).mean(1), [0.02, -0.01], atol=0.004)
+    mu, sigma, lh, K = np.array([0.02, -0.01]), np.array([0.01, 0.03]), 40, 512
+    X = copula_paths(mu, sigma, C, lh, K, rng)
+    assert np.allclose(X.std(2, ddof=1).mean(1), sigma, rtol=0.03)
+    assert (np.abs(X.sum(2).mean(1) - mu) < 4 * sigma * np.sqrt(lh / K)).all()   # within 4 s.e.
     assert abs(path_corr(X)[0, 1] - 0.5) < 0.03
 
 
@@ -75,17 +76,20 @@ def test_dependence_aware_scores_prefer_the_true_joint_distribution():
 
 
 def test_score_group_rewards_correct_dependence_and_hedges():
-    """A forecaster with the true correlation beats indep on VS, long-short portfolios and hedging."""
+    """A forecaster with the true correlation beats indep on VS, portfolios and hedging. All portfolios of one
+    replicate share one outcome, so portfolio skill is judged by its mean over replicates, not by wins."""
     rng = np.random.default_rng(5)
     M, lh, K, rho = 10, 40, 128, 0.7
-    wins = {k: [] for k in ("vs", "ls", "hedge", "corr")}
-    for _ in range(40):
+    out = {k: [] for k in ("vs_skill", "pf_ls_crps_skill", "pf_lo_crps_skill", "hedge", "corr")}
+    for _ in range(80):
         Rh = 0.01 * correlated(rng, M, 1000, rho)
         Y = 0.01 * correlated(rng, M, lh, rho)
         true = 0.01 * np.stack([correlated(rng, M, lh, rho) for _ in range(K)], axis=1)   # [M, K, lh]
         res = score_group({"true": true, "indep": indep_paths(list(Rh), lh, K, rng)}, Y, Rh, 1, rng)
-        wins["vs"].append(res["true"]["vs_skill"] > 0)
-        wins["ls"].append(res["true"]["pf_ls_crps_skill"] > 0)
-        wins["hedge"].append(res["true"]["hedge_gain"] > res["indep"]["hedge_gain"])
-        wins["corr"].append(res["true"]["corr_bias"] > res["indep"]["corr_bias"])
-    assert all(np.mean(w) > 0.75 for w in wins.values()), {k: np.mean(w) for k, w in wins.items()}
+        for k in ("vs_skill", "pf_ls_crps_skill", "pf_lo_crps_skill"):
+            out[k].append(res["true"][k])
+        out["hedge"].append(res["true"]["hedge_gain"] - res["indep"]["hedge_gain"])
+        out["corr"].append(res["true"]["corr_bias"] - res["indep"]["corr_bias"])
+    means = {k: float(np.mean(v)) for k, v in out.items()}
+    assert all(v > 0 for v in means.values()), means
+    assert np.mean(np.array(out["vs_skill"]) > 0) > 0.75, means
