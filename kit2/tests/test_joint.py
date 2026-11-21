@@ -76,20 +76,19 @@ def test_dependence_aware_scores_prefer_the_true_joint_distribution():
 
 
 def test_score_group_rewards_correct_dependence_and_hedges():
-    """A forecaster with the true correlation beats indep on VS, portfolios and hedging. All portfolios of one
-    replicate share one outcome, so portfolio skill is judged by its mean over replicates, not by wins."""
+    """A forecaster with the true correlation beats indep on VS, ES, portfolios and hedging, judged as in
+    `summarise`: mean score over replicates (the portfolios of one replicate share one outcome)."""
     rng = np.random.default_rng(5)
     M, lh, K, rho = 10, 40, 128, 0.7
-    out = {k: [] for k in ("vs_skill", "pf_ls_crps_skill", "pf_lo_crps_skill", "hedge", "corr")}
+    rows = []
     for _ in range(80):
         Rh = 0.01 * correlated(rng, M, 1000, rho)
         Y = 0.01 * correlated(rng, M, lh, rho)
         true = 0.01 * np.stack([correlated(rng, M, lh, rho) for _ in range(K)], axis=1)   # [M, K, lh]
-        res = score_group({"true": true, "indep": indep_paths(list(Rh), lh, K, rng)}, Y, Rh, 1, rng)
-        for k in ("vs_skill", "pf_ls_crps_skill", "pf_lo_crps_skill"):
-            out[k].append(res["true"][k])
-        out["hedge"].append(res["true"]["hedge_gain"] - res["indep"]["hedge_gain"])
-        out["corr"].append(res["true"]["corr_bias"] - res["indep"]["corr_bias"])
-    means = {k: float(np.mean(v)) for k, v in out.items()}
-    assert all(v > 0 for v in means.values()), means
-    assert np.mean(np.array(out["vs_skill"]) > 0) > 0.75, means
+        rows.append(score_group({"true": true, "indep": indep_paths(list(Rh), lh, K, rng)}, Y, Rh, 1, rng))
+    mean = {m: {k: np.mean([r[m][k] for r in rows]) for k in rows[0][m]} for m in ("true", "indep")}
+    for sc in ("es", "vs", "pf_ls_crps", "pf_lo_crps"):
+        assert mean["true"][sc] < mean["indep"][sc], (sc, mean)
+    assert mean["true"]["hedge_gain"] > mean["indep"]["hedge_gain"] + 0.3
+    assert abs(mean["true"]["corr_bias"]) < 0.05 and mean["indep"]["corr_bias"] < -0.5
+    assert abs(mean["true"]["pf_lo_exc05"] - 0.05) < abs(mean["indep"]["pf_lo_exc05"] - 0.05)

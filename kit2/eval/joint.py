@@ -7,13 +7,15 @@ multivariate forecast:
                 correlation of per-bar returns) against the realised correlation over the horizon
   corr bias     mean forecast minus mean realised correlation over the pairs
   ES / VS skill energy score / variogram score (p = 0.5) of the members' horizon returns, each member divided by
-                its trailing vol * sqrt(lh) (fixed in advance, the same for every model); 1 - score / score(indep)
-  portfolios    N_PF random portfolios per group, long-short (unit gross) and long-only: CRPS skill of the
-                portfolio horizon return vs indep, and the share of realised returns below the forecast 5% quantile
-                (nominal 0.05)
+                its trailing vol * sqrt(lh) (fixed in advance, the same for every model)
+  portfolios    N_PF random portfolios per group, long-short (unit gross) and long-only, each divided by its
+                trailing vol: CRPS skill of the portfolio horizon return, and the share of realised returns below the
+                forecast 5% quantile (nominal 0.05)
   hedge gain    each non-anchor member hedged with the anchor it is most correlated with on trailing bars (the same
                 hedge for every model), beta read off the forecast; HV = realised mean square of the hedged per-bar
                 returns over the horizon; gain = 1 - geometric mean over members of HV(beta) / HV(trailing OLS beta)
+Skills are 1 - mean score / mean score of indep over all groups and moments (a per-group ratio is unstable: the
+portfolios of one group share one market outcome).
 Baselines on the same members, with the same K:
   indep         K random trailing lh-bar blocks per member, drawn independently (score.py's bootstrap): no dependence
   sync          K random trailing blocks at the same (common) timestamps for every member: historical dependence
@@ -39,8 +41,9 @@ from kit2.eval.score import crps, spearman
 
 H_TRAIL = 2000    # trailing bars: bootstrap blocks, copula correlation, trailing beta, standardisation
 N_PF = 64         # random portfolios per (group, kind)
-METRICS = ["corr_rankic", "corr_bias", "es_skill", "vs_skill", "pf_ls_crps_skill", "pf_ls_exc05",
-           "pf_lo_crps_skill", "pf_lo_exc05", "hedge_gain"]
+METRICS = ["corr_rankic", "corr_bias", "es", "vs", "pf_ls_crps", "pf_ls_exc05", "pf_lo_crps", "pf_lo_exc05",
+           "hedge_gain"]
+SCORES = ["es", "vs", "pf_ls_crps", "pf_lo_crps"]   # lower is better; reported as skill against indep
 
 
 # ---- scores -------------------------------------------------------------------------------------------------------
@@ -146,7 +149,9 @@ def group_members(p, mi: int, g: int) -> List[int]:
 def score_group(paths: Dict[str, np.ndarray], Y: np.ndarray, Rh: np.ndarray, n_anc: int,
                 rng: np.random.Generator) -> Dict[str, Dict[str, float]]:
     """paths: model -> [M, K, lh]; Y [M, lh] realised; Rh [M, T] trailing returns on common timestamps; the first
-    n_anc members are market anchors. Returns model -> metrics."""
+    n_anc members are market anchors. Returns model -> raw metrics (scores are standardised by trailing vol; skills
+    are formed in `summarise` as ratios of means - the portfolios of one group share one market outcome, so a
+    per-group ratio is dominated by groups whose outcome happens to be near zero)."""
     M, lh = Y.shape
     sd = Rh.std(1) * np.sqrt(lh)                          # standardisation of horizon returns (trailing, fixed)
     y = Y.sum(1)
@@ -154,11 +159,12 @@ def score_group(paths: Dict[str, np.ndarray], Y: np.ndarray, Rh: np.ndarray, n_a
     real_c = np.corrcoef(Y)[iu]
     W = {"ls": rng.standard_normal((N_PF, M)), "lo": rng.dirichlet(np.ones(M), N_PF)}
     W["ls"] /= np.abs(W["ls"]).sum(1, keepdims=True)
+    cov_t = np.cov(Rh)
+    sd_pf = {k: np.sqrt(np.einsum("pi,ij,pj->p", w, cov_t, w) * lh) for k, w in W.items()}
     # hedges: most correlated anchor on trailing bars; trailing OLS beta is the reference hedge
     Ct = np.corrcoef(Rh)
     hedge = {i: int(np.argmax(Ct[i, :n_anc])) for i in range(n_anc, M)} if n_anc else {}
-    var_t = Rh.var(1)
-    beta_t = {i: float(np.cov(Rh[i], Rh[h])[0, 1] / var_t[h]) for i, h in hedge.items()}
+    beta_t = {i: float(cov_t[i, h] / cov_t[h, h]) for i, h in hedge.items()}
 
     def hv(i: int, beta: float) -> float:
         return float(((Y[i] - beta * Y[hedge[i]]) ** 2).mean())
@@ -173,7 +179,7 @@ def score_group(paths: Dict[str, np.ndarray], Y: np.ndarray, Rh: np.ndarray, n_a
              "corr_bias": float(np.mean(fc[ok] - real_c[ok])) if ok.any() else np.nan,
              "es": energy_score(Xs, y / sd), "vs": variogram_score(Xs, y / sd)}
         for kind, w in W.items():
-            xp, yp = w @ R, w @ y                          # [N_PF, K], [N_PF]
+            xp, yp = (w @ R) / sd_pf[kind][:, None], (w @ y) / sd_pf[kind]   # [N_PF, K], [N_PF]
             r[f"pf_{kind}_crps"] = float(crps(xp, yp).mean())
             r[f"pf_{kind}_exc05"] = float((yp < np.quantile(xp, 0.05, axis=1)).mean())
         if hedge:
@@ -183,12 +189,6 @@ def score_group(paths: Dict[str, np.ndarray], Y: np.ndarray, Rh: np.ndarray, n_a
         else:
             r["hedge_gain"] = np.nan
         out[m] = r
-    ref = out["indep"]
-    for r in out.values():
-        r["es_skill"] = 1 - r["es"] / ref["es"]
-        r["vs_skill"] = 1 - r["vs"] / ref["vs"]
-        for kind in W:
-            r[f"pf_{kind}_crps_skill"] = 1 - r[f"pf_{kind}_crps"] / ref[f"pf_{kind}_crps"]
     return out
 
 
@@ -255,26 +255,36 @@ def score_market(market: str, models: List[str], lgbm: Optional[str], seed: int 
 
 
 def summarise(df: pd.DataFrame) -> pd.DataFrame:
-    """Mean over moments (groups averaged within a moment first)."""
+    """Mean over moments (groups averaged within a moment first); scores turned into skills against indep as
+    1 - mean score / mean indep score."""
     per = df.groupby(["market", "scale", "model", "moment"])[METRICS].mean()
     out = per.groupby(level=["market", "scale", "model"]).mean()
+    for sc in SCORES:
+        ref = out[sc].xs("indep", level="model")
+        out[f"{sc}_skill"] = 1 - out[sc] / ref.reindex(out.index.droplevel("model")).to_numpy()
     out["moments"] = per.groupby(level=["market", "scale", "model"]).size()
-    return out.round(3)
+    cols = ["corr_rankic", "corr_bias"] + [f"{sc}_skill" for sc in SCORES] + ["pf_ls_exc05", "pf_lo_exc05",
+                                                                             "hedge_gain", "moments"]
+    return out[cols].round(3)
 
 
-def paired(df: pd.DataFrame, a: str, b: str, metrics=("corr_rankic", "vs_skill", "pf_ls_crps_skill",
-                                                      "pf_lo_crps_skill", "hedge_gain")) -> pd.DataFrame:
-    """Model a minus model b per moment: mean, standard error over moments, wins."""
-    per = df.groupby(["market", "scale", "model", "moment"])[list(metrics)].mean()
+def paired(df: pd.DataFrame, a: str, b: str) -> pd.DataFrame:
+    """Model a minus model b per moment, mean / standard error over moments / wins. Scores enter as
+    (score_b - score_a) / mean indep score, whose mean is skill_a - skill_b."""
+    per = df.groupby(["market", "scale", "model", "moment"])[METRICS].mean()
     rows = []
     for (market, scale), g in per.groupby(level=["market", "scale"]):
         w = g.droplevel(["market", "scale"]).unstack("model")
         r = {"market": market, "scale": scale, "moments": len(w)}
-        for met in metrics:
-            d = (w[(met, a)] - w[(met, b)]).dropna()
-            r[f"d_{met}"] = d.mean()
-            r[f"se_{met}"] = d.std(ddof=1) / np.sqrt(len(d)) if len(d) > 1 else np.nan
-            r[f"wins_{met}"] = f"{int((d > 0).sum())}/{len(d)}"
+        for met in ["corr_rankic", *SCORES, "hedge_gain"]:
+            if met in SCORES:
+                d, name = (w[(met, b)] - w[(met, a)]) / w[(met, "indep")].mean(), f"{met}_skill"
+            else:
+                d, name = w[(met, a)] - w[(met, b)], met
+            d = d.dropna()
+            r[f"d_{name}"] = d.mean()
+            r[f"se_{name}"] = d.std(ddof=1) / np.sqrt(len(d)) if len(d) > 1 else np.nan
+            r[f"wins_{name}"] = f"{int((d > 0).sum())}/{len(d)}"
         rows.append(r)
     return pd.DataFrame(rows).round(3)
 
@@ -294,8 +304,8 @@ def main() -> None:
     s.to_csv(OUT / "joint_summary.csv")
     pd.set_option("display.width", 250)
     print(s.to_string())
-    overall = df.groupby(["market", "model", "moment"])[METRICS].mean().groupby(level=["market", "model"]).mean()
-    print("\nall scales\n" + overall.round(3).to_string())
+    overall = summarise(df.assign(moment=df["scale"] + " " + df["moment"], scale="all"))
+    print("\nall scales\n" + overall.to_string())
     for b in ("lgbm_cop", "sync"):
         if b in set(df["model"]):
             pr = paired(df, models[0], b)

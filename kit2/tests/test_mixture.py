@@ -113,7 +113,7 @@ def test_weight_updates_reach_persistent_workers():
 
 def test_fit_updates_the_mixture(root):  # noqa: F811
     import lightning as L
-    from kit2.train.lit import KiT2Lit
+    from kit2.train import KiT2Lit
     dm = StoreData(str(root), ["us:1h", "us:1d"], G=8, A=4, batch_tokens=8 * 112 * 2, num_workers=0,
                    val_batches_per_bucket=1)
     lit = KiT2Lit({"preset": "tiny"}, {"lr": 1e-3, "warmup_steps": 1, "total_steps": 8}, compile=False)
