@@ -92,3 +92,14 @@ def test_score_group_rewards_correct_dependence_and_hedges():
     assert mean["true"]["hedge_gain"] > mean["indep"]["hedge_gain"] + 0.3
     assert abs(mean["true"]["corr_bias"]) < 0.05 and mean["indep"]["corr_bias"] < -0.5
     assert abs(mean["true"]["pf_lo_exc05"] - 0.05) < abs(mean["indep"]["pf_lo_exc05"] - 0.05)
+
+
+def test_conditional_copula_follows_the_given_anchor_path():
+    from kit2.eval.cond import conditional_paths
+    rng = np.random.default_rng(6)
+    rho, s_a, s_i, lh, K = 0.6, 0.01, 0.02, 30, 4096
+    C = np.array([[1.0, rho], [rho, 1.0]])
+    y_anc = rng.normal(0, s_a, (1, lh))
+    X = conditional_paths(np.array([0.0, 0.0]), np.array([s_a, s_i]), C, y_anc, K, rng)
+    np.testing.assert_allclose(X.mean(0), rho * s_i / s_a * y_anc[0], atol=4 * s_i / np.sqrt(K))
+    np.testing.assert_allclose(X.std(0).mean(), s_i * np.sqrt(1 - rho ** 2), rtol=0.03)
