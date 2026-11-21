@@ -61,6 +61,9 @@ def main() -> None:
     fn = _us if args.market == "us" else _crypto
     jobs = [(i, k, args.root) for i, k in zip(plan["panel"], plan["keys"]) if not (out / f"{i}.npz").is_file()]
     print(f"{len(plan['panel']) - len(jobs)} of {len(plan['panel'])} instruments already built", flush=True)
+    if args.market == "crypto" and jobs:
+        from kit2.data.crypto.prepare import ensure_split
+        ensure_split(args.root / "raw" / "crypto", args.root / "tmp" / "crypto_split", [k for _, k, _ in jobs])
     empty = []
     with ProcessPoolExecutor(args.workers) as ex:
         for n, (idx, bars) in enumerate(ex.map(fn, jobs), 1):
@@ -71,8 +74,8 @@ def main() -> None:
             if n % 16 == 0 or n == len(jobs):
                 print(f"{n}/{len(jobs)} instruments", flush=True)
     if empty:
-        # crypto: token_bars reads the per-token split files under tmp/crypto_split made by
-        # `kit2.data.crypto.prepare`; without them it returns no bars
+        # crypto: token_bars reads the per-token split files under tmp/crypto_split (rebuilt above when missing);
+        # a token without downloaded swaps has none
         raise SystemExit(f"no bars for {len(empty)} instruments (e.g. {empty[:5]}): source files missing; "
                          "nothing written for them")
 

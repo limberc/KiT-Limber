@@ -129,3 +129,27 @@ def test_fit_updates_the_mixture(root):  # noqa: F811
     restored = AdaptiveMixture(max_reuse=None)
     restored.load_state_dict(state)
     assert restored._restored["drawn"] == state["drawn"]
+
+
+def test_resume_from_checkpoint_continues_the_mixture(root, tmp_path):  # noqa: F811
+    """Lightning restores callback state after setup(): the resumed run keeps counting from the saved draws."""
+    import lightning as L
+    from kit2.train.lit import KiT2Lit
+
+    def run(max_steps, ckpt=None):
+        dm = StoreData(str(root), ["us:1h", "us:1d"], G=8, A=4, batch_tokens=8 * 112 * 2, num_workers=0,
+                       val_batches_per_bucket=1)
+        lit = KiT2Lit({"preset": "tiny"}, {"lr": 1e-3, "warmup_steps": 1, "total_steps": 8}, compile=False)
+        cb = AdaptiveMixture(max_reuse=None, warmup_evals=1)
+        tr = L.Trainer(accelerator="cpu", max_steps=max_steps, val_check_interval=2, check_val_every_n_epoch=None,
+                       logger=False, enable_checkpointing=False, enable_progress_bar=False, num_sanity_val_steps=0,
+                       callbacks=[cb])
+        tr.fit(lit, dm, ckpt_path=ckpt)
+        return tr, cb, dm
+
+    tr1, cb1, _ = run(4)
+    tr1.save_checkpoint(tmp_path / "last.ckpt")
+    tr2, cb2, dm2 = run(8, tmp_path / "last.ckpt")
+    assert tr2.global_step == 8 and float(cb2._counts.sum()) == 8      # 4 restored + 4 new
+    assert cb2.mix.evals == cb1.mix.evals + 2
+    np.testing.assert_allclose(dm2.train_weights.numpy(), cb2.mix.p)

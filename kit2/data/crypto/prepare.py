@@ -18,7 +18,7 @@ import time
 from concurrent.futures import ProcessPoolExecutor
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, Iterable, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -87,13 +87,18 @@ class ChainTables:
         return list(self.pools.index[self.pools["base"] == base])
 
 
-def split_chain(raw: Path, tmp: Path, chain: str) -> int:
-    """Each month's swaps -> tmp/<chain>/<base>/<YYYY-MM>.parquet (compact columns, hashed senders)."""
+def split_chain(raw: Path, tmp: Path, chain: str, bases: Optional[Iterable[str]] = None) -> int:
+    """Each month's swaps -> tmp/<chain>/<base>/<YYYY-MM>.parquet (compact columns, hashed senders). `bases`: split
+    only these tokens and the chain's non-stable quote tokens (build_refs reads those), reading only their pools."""
     ct = ChainTables(raw, chain)
     base_of = ct.pools["base"]
+    filters = None
+    if bases is not None:
+        base_of = base_of[base_of.isin(list(set(bases) | set(ct.nonstable)))]
+        filters = [("pool", "in", list(base_of.index))]
     n = 0
     for m in ct.swap_months:
-        df = pd.read_parquet(raw / "swaps" / f"{m}.parquet", columns=KEEP)
+        df = pd.read_parquet(raw / "swaps" / f"{m}.parquet", columns=KEEP, filters=filters)
         df["base"] = df["pool"].map(base_of)
         df = df[df["base"].notna()]
         df["tx_from"] = pd.util.hash_array(df["tx_from"].fillna("").to_numpy(object)).view(np.int64)
@@ -131,6 +136,22 @@ def build_refs(raw: Path, tmp: Path, chain: str) -> None:
             r = pd.concat(parts).sort_values("block").drop_duplicates("block", keep="last")
             r.to_parquet(tmp / chain / f"_ref_{kind}.parquet", index=False)
             log(f"[refs] {chain} {kind}: {len(r)} blocks")
+
+
+def ensure_split(raw_root: Path, tmp: Path, keys: Iterable[str]) -> None:
+    """Split files for the instruments `keys` ("chain:base") whose tmp/<chain>/<base> is missing (the split is not
+    needed once the store is built and may have been deleted): a split of just those tokens, then the chain's USD
+    references again. A token with no downloaded swaps stays missing."""
+    todo: Dict[str, List[str]] = {}
+    for key in keys:
+        chain, base = key.split(":")
+        if not (tmp / chain / base).is_dir():
+            todo.setdefault(chain, []).append(base)
+    for chain, bases in todo.items():
+        n = split_chain(raw_root / chain, tmp, chain, bases)
+        build_refs(raw_root / chain, tmp, chain)
+        _chain.cache_clear()
+        log(f"[split] {chain}: {len(bases)} tokens, {n} swaps")
 
 
 @lru_cache(maxsize=3)
