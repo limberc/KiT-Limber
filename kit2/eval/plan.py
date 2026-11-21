@@ -1,11 +1,11 @@
-"""Evaluation plan: test moments per (market, scale) and one fixed instrument panel per market.
+"""Evaluation plan: moments per (market, scale) and one fixed instrument panel per market.
 
-A moment is a target-scale bar close T after VAL_END such that the KiT-2 window ending h patches after T fits
-in the store (so the forecast is made at the latest anchor of a training-shaped window). The panel is drawn
-from instruments in the sampling set of every test month and covered at every moment; both models forecast
-exactly these (instrument, moment) pairs.
+A moment is a target-scale bar close T in the period (test: after VAL_END; val: Jul-Aug, targets inside it) such
+that the KiT-2 window ending h patches after T fits in the store (so the forecast is made at the latest anchor of a
+training-shaped window). The panel is drawn from instruments in the sampling set of every month of the period and
+covered at every moment; both models forecast exactly these (instrument, moment) pairs.
 
-Usage: python -m kit2.eval.plan --market us [--n-inst 64 --moments 6]
+Usage: python -m kit2.eval.plan --market us [--n-inst 64 --moments 6 --split test]
 """
 from __future__ import annotations
 
@@ -16,17 +16,18 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from kit2.data.store import VAL_END
 from kit2.env import data_root
 from kit2.eval import EVAL_SCALES, KIT_LH, OUT
 from kit2.train import GroupSampler, Bucket
+from kit2.train.data import SPLIT_RANGE
 
 
-def make_plan(root: Path, market: str, n_inst: int, n_moments: int, seed: int) -> dict:
+def make_plan(root: Path, market: str, n_inst: int, n_moments: int, seed: int, split: str = "test") -> dict:
     buckets = [Bucket(market, s) for s in EVAL_SCALES]
-    gs = GroupSampler(root, buckets, G=32, A=1, batch_tokens=1, split="test")
+    gs = GroupSampler(root, buckets, G=32, A=1, batch_tokens=1, split=split)
     st = gs.stores[market]
-    months = sorted(m for m in st.active if m > VAL_END.normalize().replace(day=1))
+    lo, hi = SPLIT_RANGE[split]
+    months = sorted(m for m in st.active if m > lo.normalize().replace(day=1) and (hi is None or m <= hi))
     pool = set(st.active[months[0]])
     for m in months[1:]:
         pool &= set(st.active[m])
@@ -56,7 +57,8 @@ def make_plan(root: Path, market: str, n_inst: int, n_moments: int, seed: int) -
         "keys": keys, "moments": moments,
         "pool_size": int(len(pool)),
         "fully_covered": int(len(full)),
-        "test_start": str(VAL_END)
+        "split": split,
+        "period_start": str(lo)
     }
 
 
@@ -66,9 +68,10 @@ def main() -> None:
     ap.add_argument("--n-inst", type=int, default=64)
     ap.add_argument("--moments", type=int, default=6)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--split", choices=("val", "test"), default="test")
     ap.add_argument("--root", type=Path, default=data_root())
     args = ap.parse_args()
-    plan = make_plan(args.root, args.market, args.n_inst, args.moments, args.seed)
+    plan = make_plan(args.root, args.market, args.n_inst, args.moments, args.seed, args.split)
     OUT.mkdir(parents=True, exist_ok=True)
     (OUT / f"plan_{args.market}.json").write_text(json.dumps(plan, indent=1))
     by = pd.DataFrame(plan["moments"]).groupby("scale")["t"].agg(["count", "min", "max"])

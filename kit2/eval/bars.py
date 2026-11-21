@@ -3,6 +3,8 @@ KiT inputs and the bootstrap baseline).
 
 Usage: python -m kit2.eval.bars --market us [--workers 16]
 Writes bars/<market>/<idx>.npz with, per scale s: s_ts (ns), s_feat [n, 5] raw candle features, s_dvol, s_has.
+Instruments that already have a file are skipped (files cover all dates, so plans for different periods can
+share them); delete a file to rebuild it.
 """
 from __future__ import annotations
 
@@ -57,12 +59,22 @@ def main() -> None:
     out = OUT / "bars" / args.market
     out.mkdir(parents=True, exist_ok=True)
     fn = _us if args.market == "us" else _crypto
-    jobs = [(i, k, args.root) for i, k in zip(plan["panel"], plan["keys"])]
+    jobs = [(i, k, args.root) for i, k in zip(plan["panel"], plan["keys"]) if not (out / f"{i}.npz").is_file()]
+    print(f"{len(plan['panel']) - len(jobs)} of {len(plan['panel'])} instruments already built", flush=True)
+    empty = []
     with ProcessPoolExecutor(args.workers) as ex:
         for n, (idx, bars) in enumerate(ex.map(fn, jobs), 1):
-            save(idx, bars, out)
+            if bars:
+                save(idx, bars, out)
+            else:
+                empty.append(idx)
             if n % 16 == 0 or n == len(jobs):
                 print(f"{n}/{len(jobs)} instruments", flush=True)
+    if empty:
+        # crypto: token_bars reads the per-token split files under tmp/crypto_split made by
+        # `kit2.data.crypto.prepare`; without them it returns no bars
+        raise SystemExit(f"no bars for {len(empty)} instruments (e.g. {empty[:5]}): source files missing; "
+                         "nothing written for them")
 
 
 if __name__ == "__main__":

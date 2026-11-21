@@ -55,9 +55,11 @@ def log_vol(y: np.ndarray, stats: dict, first: np.ndarray) -> np.ndarray:
 
 @torch.no_grad()
 def collect(model, cfg, root: Path, bk: Bucket, n_windows: int, chunk: int, paths: int, steps: int,
-            seed: int) -> List[Dict[str, np.ndarray]]:
-    """One record per (window, anchor): arrays over that cross-section's valid instruments."""
-    gs = GroupSampler(root, [bk], G=G, A=4, batch_tokens=chunk * bk.tokens(G), split="val")
+            seed: int, anchor: str = "random") -> List[Dict[str, np.ndarray]]:
+    """One record per (window, anchor): arrays over that cross-section's valid instruments. anchor "random": 4
+    anchors per window as in training; "last": the window's latest anchor only, as kit2.eval.kit2pred forecasts."""
+    gs = GroupSampler(root, [bk], G=G, A=4 if anchor == "random" else 1, batch_tokens=chunk * bk.tokens(G),
+                      split="val")
     st = gs.stores[bk.market]
     stats, cal = st.stats["scales"][bk.scale], st.scales[bk.scale].cal
     lh, h = KIT_LH[bk.scale], bk.horizon
@@ -76,6 +78,8 @@ def collect(model, cfg, root: Path, bk: Bucket, n_windows: int, chunk: int, path
         raw = gs.sample(0, rng)
         if raw is None:
             break
+        if anchor == "last":   # window ends satisfy the split, so the latest anchor's targets are inside it too
+            raw["anchors"][:] = bk.anchor_range[1]
         batch = {k: torch.as_tensor(v).cuda() for k, v in raw.items()}
         b = to_model_batch(batch, bk, gpu_tables, cfg)
         inp = model_inputs(b)
@@ -205,6 +209,7 @@ def main() -> None:
     ap.add_argument("--paths", type=int, default=16)
     ap.add_argument("--steps", type=int, default=8)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--anchor", choices=("random", "last"), default="random")
     ap.add_argument("--root", type=Path, default=data_root())
     args = ap.parse_args()
     lit = KiT2Lit.load_from_checkpoint(args.ckpt, map_location="cuda", compile=False)
@@ -213,7 +218,8 @@ def main() -> None:
     for market in args.markets.split(","):
         for scale in args.scales.split(","):
             bk = Bucket(market, scale)
-            recs = collect(model, lit.cfg, args.root, bk, args.windows, args.chunk, args.paths, args.steps, args.seed)
+            recs = collect(model, lit.cfg, args.root, bk, args.windows, args.chunk, args.paths, args.steps,
+                           args.seed, args.anchor)
             for o in evaluate(recs):
                 rows.append({"market": market, "scale": scale, **o})
             print(f"{market} {scale}: {len(recs)} cross-sections, {time.time() - t0:.0f}s", flush=True)

@@ -1,8 +1,9 @@
 """KiT-2 forecasts for the evaluation plan from a Lightning checkpoint (EMA weights).
 
 Each moment: the panel is split into groups; each group = market anchors (context, as in training) + panel
-instruments, G = 32. The forecast is made at the close of the moment's bar (the window's latest anchor patch),
-K paths, Heun sampler. Paths are denormalised with the store's training-period stats.
+instruments, filled up to G = 32 with context instruments from the moment's sampling set, so every group is full
+as in training (only panel instruments are scored). The forecast is made at the close of the moment's bar (the
+window's latest anchor patch), K paths, Heun sampler. Paths are denormalised with the store's training-period stats.
 
 Usage: python -m kit2.eval.kit2pred --market us --ckpt <path> [--paths 16 --steps 8]
 """
@@ -12,6 +13,7 @@ import argparse
 import json
 import time
 from pathlib import Path
+from typing import List
 
 import numpy as np
 import torch
@@ -23,6 +25,15 @@ from kit2.eval import EVAL_SCALES, OUT
 from kit2.train import Bucket, GroupSampler
 from kit2.train.data import to_model_batch
 from kit2.train.lit import KiT2Lit
+
+
+def fill_groups(chunks: List[np.ndarray], anchors: np.ndarray, panel: np.ndarray, active: np.ndarray, G: int,
+                rng: np.random.Generator) -> List[np.ndarray]:
+    """Candidate list per group: market anchors, the group's panel names, then context instruments from the sampling
+    set. GroupSampler.build keeps the first G covered candidates, so groups are full. Without the context fill the
+    64-name panel was split 30 + 30 + 4, and KiT-2 forecast ~4.5x the volatility for the names in the small group."""
+    ctx = rng.permutation(np.setdiff1d(active, np.concatenate([anchors, panel])))[: 4 * G]
+    return [np.concatenate([anchors, c, ctx]) for c in chunks]
 
 
 def main() -> None:
@@ -40,14 +51,14 @@ def main() -> None:
     model = lit.model.eval()
     G = 32
     buckets = [Bucket(args.market, s) for s in EVAL_SCALES]
-    gs = GroupSampler(args.root, buckets, G=G, A=1, batch_tokens=1, split="test")
+    gs = GroupSampler(args.root, buckets, G=G, A=1, batch_tokens=1, split=plan.get("split", "test"))
     st = gs.stores[args.market]
     anchors = gs.always[args.market]
     panel = np.array(plan["panel"], dtype=np.int64)
     rng = np.random.default_rng(args.seed)
     order = rng.permutation(panel)
     room = G - len(anchors)
-    groups = [np.concatenate([anchors, order[i: i + room]]) for i in range(0, len(order), room)]
+    chunks = [order[i: i + room] for i in range(0, len(order), room)]
     tables = {}
 
     def gpu_tables(m, s, dev):
@@ -62,7 +73,10 @@ def main() -> None:
         k = EVAL_SCALES.index(mo["scale"])
         bk = buckets[k]
         p_anchor = bk.n_patches[0] - bk.horizon - 1  # the window's latest anchor = the moment
+        act = st.active_at(mo["t_ns"])
+        groups = fill_groups(chunks, anchors, panel, act if act is not None else np.zeros(0, np.int64), G, rng)
         raw = gs.build(k, np.full(len(groups), mo["end"]), groups, np.full((len(groups), 1), p_anchor))
+        assert np.isin(panel, raw["inst_idx"]).all(), "a panel instrument is not covered at this moment"
         batch = {key: torch.as_tensor(v).cuda() for key, v in raw.items()}
         b = to_model_batch(batch, bk, gpu_tables, lit.cfg)
         assert int(b["anchor_close"][0, 0]) == mo["t_ns"], "anchor is not the planned moment"
@@ -79,7 +93,8 @@ def main() -> None:
         res[f"{mi}_inst"] = inst[keep]
         res[f"{mi}_ret"] = ret[keep][..., : mo["lh"]].astype(np.float32)  # [N, K, lh]
         el = time.time() - t0
-        print(f"[{mi + 1}/{len(plan['moments'])}] {mo['scale']} {mo['t']} n={int(keep.sum())} {el:.0f}s", flush=True)
+        print(f"[{mi + 1}/{len(plan['moments'])}] {mo['scale']} {mo['t']} n={int(keep.sum())} "
+              f"group sizes {raw['valid'].sum(1).min()}-{raw['valid'].sum(1).max()} {el:.0f}s", flush=True)
     out = OUT / "pred"
     out.mkdir(parents=True, exist_ok=True)
     np.savez(out / f"{args.tag}_{args.market}.npz", **res)
