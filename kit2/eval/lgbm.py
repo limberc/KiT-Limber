@@ -39,8 +39,9 @@ from kit2.eval import EVAL_SCALES, KIT_LH, OUT  # noqa: E402
 ES_START = pd.Timestamp("2026-04-30 23:59:59")   # targets after this (and <= TRAIN_END): early-stopping set
 CAL_COLS = [0, 1, 2, 3, 4, 5, 8, 9, 10, 11]      # calendar features without day of year
 FLOOR = 1e-6                                     # per-bar vol floor (flat-priced windows)
-PARAMS = dict(n_estimators=3000, learning_rate=0.03, num_leaves=63, min_child_samples=500, subsample=0.8,
-              subsample_freq=1, colsample_bytree=0.8, reg_lambda=1.0, n_jobs=8, verbose=-1)
+PARAMS = {"objective": "regression", "learning_rate": 0.03, "num_leaves": 63, "min_data_in_leaf": 500,
+          "bagging_fraction": 0.8, "bagging_freq": 1, "feature_fraction": 0.8, "lambda_l2": 1.0, "num_threads": 8,
+          "seed": 0, "verbose": -1}
 
 
 def raw_returns(X: np.ndarray, gidx: np.ndarray, first_of: np.ndarray, stats: dict) -> Tuple[np.ndarray, np.ndarray]:
@@ -100,13 +101,13 @@ def build(sc, stats: dict, off: np.ndarray, g: np.ndarray, H: int, lh: int, chun
     return np.concatenate(F), np.concatenate(R), np.concatenate(V)
 
 
-def fit(F: np.ndarray, y: np.ndarray, es: np.ndarray, clip: bool) -> lgb.LGBMRegressor:
+def fit(F: np.ndarray, y: np.ndarray, es: np.ndarray, clip: bool) -> lgb.Booster:
     if clip:   # heavy-tailed horizon returns: winsorise at the fit set's 1st / 99th percentiles
         lo, hi = np.quantile(y[~es], [0.01, 0.99])
         y = np.clip(y, lo, hi)
-    m = lgb.LGBMRegressor(**PARAMS, random_state=0)
-    m.fit(F[~es], y[~es], eval_set=[(F[es], y[es])], callbacks=[lgb.early_stopping(100, verbose=False)])
-    return m
+    train = lgb.Dataset(F[~es], y[~es])
+    return lgb.train(PARAMS, train, num_boost_round=3000, valid_sets=[lgb.Dataset(F[es], y[es], reference=train)],
+                     callbacks=[lgb.early_stopping(100, verbose=False)])
 
 
 def gaussian_paths(mu: np.ndarray, sigma: np.ndarray, lh: int, K: int, rng: np.random.Generator) -> np.ndarray:
@@ -144,7 +145,7 @@ def main() -> None:
         m_ret, m_vol = fit(F, R, es, clip=True), fit(F, V, es, clip=False)
         models[s] = (m_ret, m_vol)
         print(f"{args.market} {s}: fit {int((~es).sum())} / early-stop {int(es.sum())} samples, trees ret "
-              f"{m_ret.best_iteration_} vol {m_vol.best_iteration_}, {time.time() - t0:.0f}s", flush=True)
+              f"{m_ret.best_iteration} vol {m_vol.best_iteration}, {time.time() - t0:.0f}s", flush=True)
     res, t0 = {}, time.time()
     for mi, mo in enumerate(plan["moments"]):
         s, lh = mo["scale"], mo["lh"]
@@ -155,7 +156,8 @@ def main() -> None:
         F = features(sc.X[(off[ok] + H - 1)[:, None] + np.arange(-H + 1, 1)], g[:, None] + np.arange(-H + 1, 1),
                      sc.cal[:, CAL_FIRST] > 0.5, sc.cal, stats, lh)
         m_ret, m_vol = models[s]
-        mu, sigma = m_ret.predict(F), np.exp(m_vol.predict(F))
+        mu = m_ret.predict(F, num_iteration=m_ret.best_iteration)
+        sigma = np.exp(m_vol.predict(F, num_iteration=m_vol.best_iteration))
         res[f"{mi}_inst"] = panel[ok]
         res[f"{mi}_ret"] = gaussian_paths(mu, sigma, lh, args.paths, rng).astype(np.float32)
     el = time.time() - t0

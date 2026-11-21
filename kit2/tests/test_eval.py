@@ -47,5 +47,5 @@ def test_lgbm_paths_carry_exact_mean_and_vol():
     P = gaussian_paths(mu, sigma, 20, 16, rng)
     np.testing.assert_allclose(P.sum(2).mean(1), mu, atol=1e-12)                  # score's return forecast
     np.testing.assert_allclose(P.std(2, ddof=1), np.repeat(sigma[:, None], 16, 1))  # score's vol forecast
-    assert spearman(P.std(2, ddof=1).mean(1), sigma) == 1.0
+    assert abs(spearman(P.std(2, ddof=1).mean(1), sigma) - 1.0) < 1e-12
     np.testing.assert_allclose(P.sum(2).std(1), sigma * np.sqrt(20), rtol=0.1)     # horizon spread ~ sigma sqrt(lh)
