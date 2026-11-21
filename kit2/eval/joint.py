@@ -14,6 +14,9 @@ multivariate forecast:
   hedge gain    each non-anchor member hedged with the anchor it is most correlated with on trailing bars (the same
                 hedge for every model), beta read off the forecast; HV = realised mean square of the hedged per-bar
                 returns over the horizon; gain = 1 - geometric mean over members of HV(beta) / HV(trailing OLS beta)
+  GMV gain      global minimum-variance portfolio (shorts allowed) on the forecast's per-bar covariance; realised
+                mean square of its per-bar returns against the same portfolio on the trailing Ledoit-Wolf covariance,
+                gain = 1 - geometric mean over moments of the ratio (> 0: the forecast's portfolio is less risky)
 Skills are 1 - mean score / mean score of indep over all groups and moments (a per-group ratio is unstable: the
 portfolios of one group share one market outcome).
 Baselines on the same members, with the same K:
@@ -42,7 +45,7 @@ from kit2.eval.score import crps, spearman
 H_TRAIL = 2000    # trailing bars: bootstrap blocks, copula correlation, trailing beta, standardisation
 N_PF = 64         # random portfolios per (group, kind)
 METRICS = ["corr_rankic", "corr_bias", "es", "vs", "pf_ls_crps", "pf_ls_exc05", "pf_lo_crps", "pf_lo_exc05",
-           "hedge_gain"]
+           "hedge_gain", "gmv_lr"]
 SCORES = ["es", "vs", "pf_ls_crps", "pf_lo_crps"]   # lower is better; reported as skill against indep
 
 
@@ -69,6 +72,19 @@ def variogram_score(X: np.ndarray, y: np.ndarray, p: float = 0.5) -> float:
     dy = np.abs(y[:, None] - y[None])[iu] ** p
     dx = (np.abs(X[:, :, None] - X[:, None, :]) ** p).mean(0)[iu]
     return float(((dy - dx) ** 2).sum())
+
+
+def path_cov(X: np.ndarray) -> np.ndarray:
+    """X [M, K, n] -> covariance of per-bar returns pooled over paths (each path demeaned) [M, M]."""
+    Z = X - X.mean(2, keepdims=True)
+    return np.einsum("ikt,jkt->ij", Z, Z) / (Z.shape[1] * (Z.shape[2] - 1))
+
+
+def gmv_weights(S: np.ndarray) -> np.ndarray:
+    """Global minimum-variance weights (shorts allowed, sum 1) of covariance S, with a small ridge."""
+    S = S + 1e-6 * np.trace(S) / len(S) * np.eye(len(S))
+    w = np.linalg.solve(S, np.ones(len(S)))
+    return w / w.sum()
 
 
 def path_beta(xi: np.ndarray, xh: np.ndarray) -> float:
@@ -183,6 +199,10 @@ def score_group(paths: Dict[str, np.ndarray], Y: np.ndarray, Rh: np.ndarray, n_a
     def hv(i: int, beta: float) -> float:
         return float(((Y[i] - beta * Y[hedge[i]]) ** 2).mean())
 
+    # minimum-variance portfolio: reference = GMV on the trailing Ledoit-Wolf covariance
+    sd_t = np.sqrt(np.diag(cov_t))
+    rv_lw = float(((gmv_weights(ledoit_wolf_corr(Rh.T) * np.outer(sd_t, sd_t)) @ Y) ** 2).mean())
+
     out = {}
     for m, X in paths.items():
         R = X.sum(2)                                      # [M, K] horizon returns
@@ -202,6 +222,7 @@ def score_group(paths: Dict[str, np.ndarray], Y: np.ndarray, Rh: np.ndarray, n_a
             r["hedge_gain"] = float(1 - np.exp(np.mean(lr)))
         else:
             r["hedge_gain"] = np.nan
+        r["gmv_lr"] = float(np.log(max(((gmv_weights(path_cov(X)) @ Y) ** 2).mean(), 1e-30) / max(rv_lw, 1e-30)))
         out[m] = r
     return out
 
@@ -270,9 +291,10 @@ def summarise(df: pd.DataFrame) -> pd.DataFrame:
     for sc in SCORES:
         ref = out[sc].xs("indep", level="model")
         out[f"{sc}_skill"] = 1 - out[sc] / ref.reindex(out.index.droplevel("model")).to_numpy()
+    out["gmv_gain"] = 1 - np.exp(out["gmv_lr"])
     out["moments"] = per.groupby(level=["market", "scale", "model"]).size()
     cols = ["corr_rankic", "corr_bias"] + [f"{sc}_skill" for sc in SCORES] + ["pf_ls_exc05", "pf_lo_exc05",
-                                                                             "hedge_gain", "moments"]
+                                                                             "hedge_gain", "gmv_gain", "moments"]
     return out[cols].round(3)
 
 
@@ -284,9 +306,11 @@ def paired(df: pd.DataFrame, a: str, b: str) -> pd.DataFrame:
     for (market, scale), g in per.groupby(level=["market", "scale"]):
         w = g.droplevel(["market", "scale"]).unstack("model")
         r = {"market": market, "scale": scale, "moments": len(w)}
-        for met in ["corr_rankic", *SCORES, "hedge_gain"]:
+        for met in ["corr_rankic", *SCORES, "hedge_gain", "gmv_lr"]:
             if met in SCORES:
                 d, name = (w[(met, b)] - w[(met, a)]) / w[(met, "indep")].mean(), f"{met}_skill"
+            elif met == "gmv_lr":                                 # log realised-variance ratio: lower is better
+                d, name = w[(met, b)] - w[(met, a)], "gmv_dlog"
             else:
                 d, name = w[(met, a)] - w[(met, b)], met
             d = d.dropna()

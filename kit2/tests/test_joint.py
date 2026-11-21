@@ -103,3 +103,23 @@ def test_conditional_copula_follows_the_given_anchor_path():
     X = conditional_paths(np.array([0.0, 0.0]), np.array([s_a, s_i]), C, y_anc, K, rng)
     np.testing.assert_allclose(X.mean(0), rho * s_i / s_a * y_anc[0], atol=4 * s_i / np.sqrt(K))
     np.testing.assert_allclose(X.std(0).mean(), s_i * np.sqrt(1 - rho ** 2), rtol=0.03)
+
+
+def test_gmv_from_the_true_covariance_beats_ignoring_correlation():
+    """Factor returns with mixed betas and vols: the true-covariance forecaster's minimum-variance portfolio matches
+    the trailing Ledoit-Wolf one (gmv_lr ~ 0); a forecaster without correlation does worse (gmv_lr > 0)."""
+    rng = np.random.default_rng(7)
+    M, lh, K = 10, 60, 128
+    beta, idio = np.linspace(0.5, 1.5, M), np.linspace(0.5, 2.0, M)
+
+    def draw(n):
+        return 0.01 * (beta[:, None] * rng.standard_normal(n) + idio[:, None] * rng.standard_normal((M, n)))
+
+    lr = {"true": [], "indep": []}
+    for _ in range(40):
+        Rh, Y = draw(2000), draw(lh)
+        true = np.stack([draw(lh) for _ in range(K)], axis=1)
+        res = score_group({"true": true, "indep": indep_paths(list(Rh), lh, K, rng)}, Y, Rh, 1, rng)
+        for m in lr:
+            lr[m].append(res[m]["gmv_lr"])
+    assert abs(np.mean(lr["true"])) < 0.1 and np.mean(lr["indep"]) > np.mean(lr["true"]) + 0.1, lr
