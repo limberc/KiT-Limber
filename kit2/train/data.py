@@ -21,8 +21,9 @@ import torch
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
 from kit2.data import MarketStore
+from kit2.train import ScaleWindow
 from kit2.data.store import CHANNELS, TRAIN_END, VAL_END
-from kit2.train.batch import ScaleWindow, assemble, audit
+from kit2.train.batch import assemble, audit
 from kit2.train.buckets import MARKET_ID, SCALE_ID, Bucket
 
 ALWAYS = {"us": ("SPY", "QQQ")}  # market anchors put in every US group when covered
