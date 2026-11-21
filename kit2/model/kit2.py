@@ -167,8 +167,10 @@ def flow_loss(model: KiT2, b: Batch, x0: torch.Tensor, weight: torch.Tensor,
     dt = model.dtype
     x0 = x0.to(dt)
     B, A = x0.shape[:2]
-    t = torch.sigmoid(torch.randn((B, A), device=x0.device, generator=generator))
-    eps = torch.randn(x0.shape, device=x0.device, generator=generator, dtype=dt)
+    t = torch.sigmoid(torch.randn((B, A), device=x0.device,
+                                  generator=generator))
+    eps = torch.randn(x0.shape, device=x0.device,
+                      generator=generator, dtype=dt)
     tt = rearrange(t, "b a -> b a 1 1 1").to(dt)
     v = model(b, (1 - tt) * x0 + tt * eps, t)
     err = reduce((v - (eps - x0)).pow(2), "b a g h c -> b a g", "mean")
