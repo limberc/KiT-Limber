@@ -55,15 +55,3 @@ class CalendarEmbed(nn.Module):
                 + self.sess_fc2(F.silu(self.sess_fc1(sess)))
                 + self.dow(dow) + self.event(event)
                 + self.month(month) + self.yday_proj(yday))
-
-
-def make_role_embedding(d: int) -> nn.Embedding:
-    """Role embedding: 0 = ctx, 1 = tgt."""
-    return nn.Embedding(2, d)
-
-
-def make_register_tokens(n_registers: int, d: int) -> nn.Parameter:
-    """Learnable register tokens [n_registers, d]."""
-    p = nn.Parameter(torch.empty(n_registers, d))
-    nn.init.normal_(p, mean=0.0, std=0.02)
-    return p
