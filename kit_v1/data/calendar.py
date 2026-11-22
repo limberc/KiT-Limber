@@ -67,8 +67,6 @@ def _market_session_grids(market: str, timescale: str) -> List[List[int]]:
 
 def bars_per_session(market: str, timescale: str) -> List[int]:
     """Number of bars in each session, e.g. US 1h => [7], 2h => [4]; 1d => [1]."""
-    if timescale in DAILY_SINGLE_BAR_SCALES:
-        return [1]
     return [len(g) for g in _market_session_grids(market, timescale)]
 
 
@@ -84,10 +82,7 @@ def _close_minute(market: str) -> int:
 
 def _daily_grid_minutes(market: str, timescale: str) -> List[int]:
     """Close minutes of all bars in a day (1440 means next-day 00:00)."""
-    out: List[int] = []
-    for grid in _market_session_grids(market, timescale):
-        out.extend(grid)
-    return out
+    return [m for grid in _market_session_grids(market, timescale) for m in grid]
 
 
 def _owning_days(idx: pd.DatetimeIndex, market: str) -> pd.DatetimeIndex:
@@ -193,23 +188,9 @@ def load_trading_days(path: Union[str, Path]) -> TradingDays:
         arr = np.sort(days.to_numpy().astype("datetime64[D]"))
         return arr if len(arr) else None
     except Exception as e:  # noqa: BLE001
-        warnings.warn(f"交易日表解析失败（{p}）：{e}；回退只跳周末口径",
+        warnings.warn(f"cannot parse trading-day table {p}: {e}; falling back to skipping weekends only",
                       RuntimeWarning, stacklevel=2)
         return None
-
-
-def load_market_trading_days(data_root: Union[str, Path],
-                             market: str) -> TradingDays:
-    """Load the trading-day table for a market.
-
-    Tries <data_root>/<market>/trade_dates.csv, then <data_root>/trade_dates.csv,
-    else returns None.
-    """
-    root = Path(data_root)
-    td = load_trading_days(root / str(market) / "trade_dates.csv")
-    if td is None:
-        td = load_trading_days(root / "trade_dates.csv")
-    return td
 
 
 def _is_trading_day(day: pd.Timestamp, trading_days: TradingDays) -> bool:
@@ -344,10 +325,9 @@ def attach_window_calendar(
         event = detect_events(timestamps, market, timescale, prev_ts=prev_ts,
                               trading_days=trading_days)
     else:
-        event = np.asarray(events, dtype=np.int64).copy()
+        event = np.array(events, dtype=np.int64)  # a copy: the target part is zeroed below
         if event.shape[0] != len(cal["dow"]):
-            raise ValueError("events 长度必须与 timestamps 一致")
-    event = event.astype(np.int64, copy=True)
+            raise ValueError(f"events has {event.shape[0]} entries but there are {len(cal['dow'])} timestamps")
     event[n_ctx:] = 0
     cal["event"] = event
     return cal

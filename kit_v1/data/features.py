@@ -15,6 +15,7 @@ from __future__ import annotations
 from typing import Dict, Tuple
 
 import numpy as np
+import pandas as pd
 
 # Feature order; also the feature part of the stats.json keys.
 FEATURE_NAMES: Tuple[str, ...] = ("r_gap", "r_body", "r_up", "r_dn", "v")
@@ -23,7 +24,7 @@ FEATURE_NAMES: Tuple[str, ...] = ("r_gap", "r_body", "r_up", "r_dn", "v")
 def ema_alpha(half_life_bars: float) -> float:
     """EMA smoothing factor from a half-life in bars."""
     if half_life_bars <= 0:
-        raise ValueError(f"half_life_bars 必须为正数，收到 {half_life_bars}")
+        raise ValueError(f"half_life_bars must be positive, got {half_life_bars}")
     return float(1.0 - 2.0 ** (-1.0 / half_life_bars))
 
 
@@ -31,12 +32,11 @@ def compute_volume_ema(volume: np.ndarray, half_life_bars: float) -> np.ndarray:
     """Volume EMA where EMA[t] depends only on V[0..t-1]; EMA[0] = V[0]."""
     v = np.asarray(volume, dtype=np.float64)
     if v.ndim != 1:
-        raise ValueError("volume 必须是一维数组")
+        raise ValueError(f"volume must be 1-D, got shape {v.shape}")
     n = v.shape[0]
     alpha = ema_alpha(half_life_bars)
     if n == 0:
         return np.zeros(0, dtype=np.float64)
-    import pandas as pd
     y = pd.Series(v).ewm(alpha=alpha, adjust=False).mean().to_numpy()
     ema = np.empty(n, dtype=np.float64)
     ema[0] = v[0]
@@ -65,7 +65,7 @@ def compute_features(
     vol = np.asarray(volume, dtype=np.float64)
     n = o.shape[0]
     if not (h.shape[0] == l.shape[0] == c.shape[0] == vol.shape[0] == n):
-        raise ValueError("OHLCV 各数组长度必须一致")
+        raise ValueError("open/high/low/close/volume must have the same length")
 
     r_gap = np.zeros(n, dtype=np.float64)
     if n > 1:

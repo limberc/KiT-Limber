@@ -5,7 +5,7 @@ features are added to the token embeddings.
 """
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -14,8 +14,7 @@ import torch.utils.checkpoint
 from kit_v1.config import ModelConfig
 from kit_v1.model.adaln import SharedAdaLN
 from kit_v1.model.block import DiTBlock
-from kit_v1.model.embeddings import (CalendarEmbed, CondEmbeddings,
-                                     make_register_tokens, make_role_embedding)
+from kit_v1.model.embeddings import CalendarEmbed, CondEmbeddings
 from kit_v1.model.layers import (RMSNorm, RotaryEmbedding, TimestepEmbedding,
                                  Timesteps, llama_config, prepare_backend, resolve_backend)
 
@@ -45,8 +44,9 @@ class KlineDiT(nn.Module):
         d = cfg.d_model
 
         self.in_proj = nn.Linear(cfg.in_features, d)
-        self.role_emb = make_role_embedding(d)
-        self.register = make_register_tokens(cfg.n_registers, d)
+        self.role_emb = nn.Embedding(2, d)  # 0 = ctx, 1 = tgt
+        self.register = nn.Parameter(torch.empty(cfg.n_registers, d))  # learnable register tokens
+        nn.init.normal_(self.register, mean=0.0, std=0.02)
         self.calendar = CalendarEmbed(d, cfg.clock_dim, cfg.sess_hidden, cfg.yday_dim)
         self.cond_emb = CondEmbeddings(d, cfg.market_slots, cfg.sector_slots,
                                        cfg.scale_slots, cfg.inst_vocab, cfg.inst_dim)
@@ -100,14 +100,13 @@ class KlineDiT(nn.Module):
         return self.t_emb(self.t_proj(t * 1000.0).to(self.t_emb.linear_1.weight.dtype))
 
     def forward(self, z: torch.Tensor, t: torch.Tensor,
-                cond: Dict[str, torch.Tensor], Lh: int,
-                return_aux: bool = False, ) -> Union[torch.Tensor, Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
+                cond: Dict[str, torch.Tensor], Lh: int) -> torch.Tensor:
         """z [B,L,F] (clean ctx + noisy tgt); t [B] float in [0,1]; Lh = target length.
 
         cond: clock [B,L,16], sess [B,L,2], yday [B,L,8] float;
         dow/event/month [B,L] long; market/sector/inst/scale [B] long;
         pad_mask [B,L] bool (True=valid, optional).
-        Returns v_pred [B,Lh,F] (plus intermediate modulations if return_aux).
+        Returns v_pred [B,Lh,F].
         """
         B, L, _ = z.shape
         Lc = L - Lh
@@ -153,13 +152,4 @@ class KlineDiT(nn.Module):
         shift_f, scale_f = (head_mod + self.head_bias).chunk(2, dim=-1)  # each [B,d]
         h = (self.final_norm(x_tgt) * (1 + scale_f.unsqueeze(1))
              + shift_f.unsqueeze(1))
-        v_pred = self.out_proj(h)  # [B,Lh,F]
-
-        if return_aux:
-            return v_pred, {"c_mod_ctx": c_mod_ctx, "c_mod_tgt": c_mod_tgt,
-                            "head_mod": head_mod, "c_base": c_base}
-        return v_pred
-
-    def count_params(self, trainable_only: bool = False) -> int:
-        return sum(p.numel() for p in self.parameters()
-                   if (p.requires_grad or not trainable_only))
+        return self.out_proj(h)  # [B,Lh,F]
