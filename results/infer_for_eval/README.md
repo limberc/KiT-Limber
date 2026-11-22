@@ -1,3 +1,3 @@
 # results/infer_for_eval/
 
-Generated on eval; You can re-run full IC/RanIC to here, contents are git-ignored.
+Written by `eval/infer_for_eval.py` (`raw/`) and `eval/cal_metrics.py` (`metrics/`, IC / RankIC); contents are git-ignored.

@@ -12,4 +12,5 @@ data/
   ashare/{1m,5m,15m,30m,1h,2h,1d}/<code>.parquet
 ```
 
-TODO: download link (cloud drive) will be added here and in the top-level README.
+Download: `huggingface-cli download Lucifer744/KiT_data_demo --local-dir data/ --repo-type dataset`
+([KiT_data_demo](https://huggingface.co/datasets/Lucifer744/KiT_data_demo)).

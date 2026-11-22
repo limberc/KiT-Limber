@@ -548,36 +548,35 @@ huggingface-cli download Lucifer744/KiT_data_demo --local-dir data/ --repo-type 
 
 The demo data includes 100 stocks. If you want to use your own data instead:
 
-1. **Data format**: Each stock needs parquet files per timescale (1m, 5m, 15m, 30m, 1h, 2h, 1d) with columns:
-   - `date`: timestamp (datetime64[ns])
-   - `open`, `high`, `low`, `close`: prices (float64)
+1. **Data format**: Each stock needs one parquet file per timescale (1m, 5m, 15m, 30m, 1h, 2h, 1d) with columns:
+   - `datetime`: bar close time, exchange-local and tz-naive (datetime64[ns]); a 1d bar is stamped at the market close
+   - `open`, `high`, `low`, `close`: adjusted prices (float64)
    - `volume`: trading volume (float64)
 
-2. **Directory structure**:
+2. **Directory structure** (the eval scripts read the `ashare` market):
    ```
    data/
-   ├── instruments.json       # List of instruments with metadata
-   ├── stats.json            # Normalization statistics
-   ├── trade_dates.csv       # Trading calendar
-   └── ashare/               # Or your market name
-       ├── 000001.SZ_1m.parquet
-       ├── 000001.SZ_5m.parquet
+   ├── instruments.json       # Embedding ids of the instruments
+   ├── stats.json             # Normalization statistics from training
+   ├── trade_dates.csv        # Trading calendar, first column YYYYMMDD
+   └── ashare/
+       ├── 1m/000001.SZ.parquet
+       ├── 5m/000001.SZ.parquet
        └── ...
    ```
 
-3. **instruments.json** should contain:
+3. **instruments.json** maps each code to its market and the checkpoint's embedding ids (`0` = unknown, for a stock or sector the model has not seen):
    ```json
    {
-     "000001.SZ": {
-       "name": "xxxx",
-       "market": "SZ",
-       "sector": "xxx",
-       "list_date": "1991-04-03"
+     "000042.SZ": {
+       "market": "ashare",
+       "sector": 0,
+       "vocab_index": 19
      }
    }
    ```
 
-Refer to the demo data structure for the exact format requirements.
+Keep the `stats.json` that comes with the checkpoint: the model was trained on features scaled by it.
 
 ### 3. Train
 
