@@ -131,11 +131,20 @@ def main() -> None:
                     r |= {c: float(s[gi, 1 + j, slot]) for j, c in enumerate(CORRUPTIONS)}
                     rows.append(r)
         print(f"[{mi + 1}/{len(plan['moments'])}] {mo['scale']} {mo['t']} {time.time() - t0:.0f}s", flush=True)
-    df = pd.DataFrame(rows).drop_duplicates(["moment", "scale", "inst", "model"])   # anchors in the panel: once
+    df = pd.DataFrame(rows).drop_duplicates(["moment", "scale", "inst", "model"])  # anchors in the panel: once
     df.to_csv(OUT / f"surprise_{args.tag}_{args.market}.csv", index=False)
-    auc = df.assign(**{c: df[c] > df["real"] for c in CORRUPTIONS}).groupby(["scale", "model"])[list(CORRUPTIONS)]
     pd.set_option("display.width", 200)
-    print("paired AUROC: P(surprise of corrupted > real)\n" + auc.mean().round(3).to_string())
+    print("paired AUROC: P(surprise of corrupted > real), ties 0.5\n" + paired_auroc(df).round(3).to_string())
+
+
+def paired_auroc(df: pd.DataFrame) -> pd.DataFrame:
+    """Per (scale, model): share of (name, moment) whose corrupted window is more surprising than the real one. Near
+    ties count 0.5 - trail_gauss scores shuffled windows identically up to rounding, which is the point."""
+    out = df.copy()
+    for c in CORRUPTIONS:
+        d = df[c] - df["real"]
+        out[c] = np.where(d.abs() <= 1e-4 * df["real"].abs().clip(lower=1.0), 0.5, (d > 0).astype(float))
+    return out.groupby(["scale", "model"])[list(CORRUPTIONS)].mean()
 
 
 if __name__ == "__main__":
