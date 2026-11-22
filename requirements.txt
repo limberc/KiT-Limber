@@ -1,11 +1,14 @@
 torch>=2.4
 transformers>=5.23   # Llama RMSNorm / SwiGLU MLP / RoPE layers
-diffusers>=0.43     # timestep embedding, attention backend dispatch
-einops>=0.8           # tensor rearrangement (traced by torch.compile)
-lightning>=2.6        # KiT-2 trainer
-kernels             # optional: hub kernels (Liger RMSNorm/SwiGLU, flash/sage attention)
+diffusers>=0.43      # affine-free RMSNorm, timestep embedding
+einops>=0.8          # tensor rearrangement (traced by torch.compile)
+lightning>=2.6       # trainer (LightningCLI)
 numpy
 pandas
 pyarrow
-matplotlib   # plots written by eval/infer_for_pred.py and eval/backtest.py
-akshare      # only to download CSI500 for eval/backtest.py (optional)
+exchange_calendars   # US trading calendar
+hypersync            # on-chain crypto download (Envio HyperSync)
+lightgbm             # LightGBM baseline (kit2/eval/lgbm.py)
+scipy                # kit2/eval/lgbm.py
+pytest
+# optional: torchao, for bf16-true training with stochastic rounding (kit2/train/lit.py)

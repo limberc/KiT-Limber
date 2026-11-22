@@ -1,12 +1,12 @@
 # ckpt/
 
-Put the model checkpoint here (contents are git-ignored). `huggingface-cli download Lucifer744/KiT_model --local-dir ckpt/`
-([KiT_model](https://huggingface.co/Lucifer744/KiT_model)) puts the default checkpoint at:
+Local KiT-2 checkpoints (contents are git-ignored). KiT-2 checkpoints are not released yet.
 
 ```
-ckpt/step_market_284M/step_market_284M.pt     KiT-L (283.7M params), EMA weights included
-ckpt/step_market_284M/instruments.json
-ckpt/step_market_284M/stats.json
+ckpt/kit2/<run>/<step>-<val_loss>.ckpt   Lightning checkpoint
+ckpt/kit2/<run>/config.yaml              LightningCLI config of the run
+ckpt/kit2/<run>/hparams.yaml, metrics.csv
+ckpt/kit2/MANIFEST.md                    runs, eval tags, md5 sums, where the other checkpoints are archived
 ```
 
-`eval/infer_for_eval.py` and `eval/infer_for_pred.py` default to this path; pass `--ckpt` for another checkpoint.
+Pass a checkpoint with `--ckpt` to `kit2.eval.kit2pred`, `kit2.eval.surprise` or `kit2.eval.probe`.

@@ -1,18 +1,14 @@
-
-/data/*
-!/data/README.md
+/data/
 /ckpt/*
 !/ckpt/README.md
-
-
-/results/infer_for_eval/*
-!/results/infer_for_eval/README.md
-# results/infer_for_pred/ is tracked on purpose.
 
 __pycache__/
 *.pyc
 .pytest_cache/
 .vscode/
+.idea/
+.codegraph/
+.DS_Store
 
 # secrets
 .env

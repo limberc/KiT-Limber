@@ -6,13 +6,17 @@ features (split/dividend-adjusted gaps, segment starts with zero gap) and dollar
 same history. Timestamps follow KiT's conventions: US bars in exchange-local time on the XNYS calendar, crypto
 in UTC with every calendar day a trading day.
 
-Usage: python -m kit2.eval.kit --market us
+KiT is not part of this repo: $KIT_ROOT (default /root/kit_hf) is a KiT v1 checkout with the `kit_v1` package (this
+repo up to commit 1113d69) and the checkpoint under ckpt/step_market_284M/.
+
+Usage: KIT_ROOT=<kit checkout> python -m kit2.eval.kit --market us
 """
 from __future__ import annotations
 
 import argparse
 import json
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -23,7 +27,7 @@ import torch
 
 from kit2.eval import KIT_LC, KIT_LH, OUT
 
-KIT_ROOT = Path("/root/kit_hf")
+KIT_ROOT = Path(os.environ.get("KIT_ROOT", "/root/kit_hf"))
 CKPT = KIT_ROOT / "ckpt" / "step_market_284M" / "step_market_284M.pt"
 # on-chain tokens KiT knows under a CEX ticker
 CRYPTO_ALIAS = {"WETH": "ETHUSDT", "WBTC": "BTCUSDT", "cbBTC": "BTCUSDT"}
@@ -97,7 +101,7 @@ def main() -> None:
     for mi, mo in enumerate(plan["moments"]):
         s, t_ns = mo["scale"], mo["t_ns"]
         Lc, Lh = KIT_LC[s], KIT_LH[s]
-        # as in eval/infer_for_eval.py: enough bars before the window for KiT's volume EMA to warm up
+        # as in KiT's eval/infer_for_eval.py: enough bars before the window for KiT's volume EMA to warm up
         keep = Lc + int(math.ceil(12.0 * cfg.data.vol_ema_half_life_days * kit_bars_per_day(market, s))) + 8
         wins, used = [], []
         for (sector, vocab), i in zip(ids, plan["panel"]):
