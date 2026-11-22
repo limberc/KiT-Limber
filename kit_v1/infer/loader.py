@@ -22,7 +22,7 @@ def load_model_and_config(
             cfg = Config.load_yaml(config_path, base=cfg)
         model = KlineDiT(cfg.model)
         print(f"[warn] --ckpt none: using randomly initialized {preset!r} model"
-              + (f"(YAML override: {config_path})" if config_path else "")
+              + (f" (YAML override: {config_path})" if config_path else "")
               + " (smoke test only)")
         return model, cfg
     p = Path(ckpt_path)
